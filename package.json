@@ -1,6 +1,6 @@
 {
     "name": "@arcdev-llc/pi-lsp",
-    "version": "1.0.4",
+    "version": "1.1.0",
     "description": "Semantic code navigation, diagnostics, and refactoring for pi via Language Server Protocol (definition, references, hover, rename, code actions, workspace diagnostics) across Dart/Flutter, TypeScript, Vue, Svelte, Python, Go, Kotlin, Swift, and Rust",
     "scripts": {
         "build": "rslib build",
