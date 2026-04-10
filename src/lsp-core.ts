@@ -72,7 +72,7 @@ interface LSPServerConfig {
   spawn: (root: string) => Promise<{ process: ChildProcessWithoutNullStreams; initOptions?: Record<string, unknown> } | undefined>;
 }
 
-interface OpenFile { version: number; lastAccess: number; }
+interface OpenFile { version: number; lastAccess: number; contentHash: string; }
 
 interface LSPClient {
   connection: MessageConnection;
@@ -238,7 +238,7 @@ export function truncateHead(lines: string[], maxLines: number, maxBytes: number
 const SEARCH_PATHS = [
   ...(process.env.PATH?.split(path.delimiter) || []),
   "/usr/local/bin", "/opt/homebrew/bin",
-  `${process.env.HOME}/.pub-cache/bin`, `${process.env.HOME}/fvm/default/bin`,
+  `${process.env.HOME}/.pub-cache/bin`, `${process.env.HOME}/.fvm/default/bin`,
   `${process.env.HOME}/go/bin`, `${process.env.HOME}/.cargo/bin`,
 ];
 
@@ -247,6 +247,12 @@ const MISE_NPM_BINS = [
   `${process.env.HOME}/.local/share/mise/installs`,
   `${process.env.HOME}/.npm`,
 ];
+
+// Cache: command → resolved path (null = definitely not found, string = found, absent = not cached)
+const WHICH_CACHE = new Map<string, string | null>();
+
+// Cache: `${filePath}:${cwd}` → root or undefined
+const ROOT_CACHE = new Map<string, string | undefined>();
 
 function statPathResult(targetPath: string): E.Either<FsProbeError, fs.Stats> {
   return E.tryCatch(
@@ -311,11 +317,17 @@ function pathExists(targetPath: string): boolean {
 }
 
 function which(cmd: string): string | undefined {
+  const cached = WHICH_CACHE.get(cmd);
+  if (cached !== undefined) return cached ?? undefined;
+
   const ext = process.platform === "win32" ? ".exe" : "";
 
   for (const dir of SEARCH_PATHS) {
     const full = path.join(dir, cmd + ext);
-    if (isExistingFile(full)) return full;
+    if (isExistingFile(full)) {
+      WHICH_CACHE.set(cmd, full);
+      return full;
+    }
   }
 
   const binSuffixes = [`bin/${cmd}`, `bin/${cmd}.js`, `bin/${cmd}${ext}`];
@@ -327,7 +339,10 @@ function which(cmd: string): string | undefined {
 
       for (const suffix of binSuffixes) {
         const full = path.join(candidate, suffix);
-        if (isExistingFile(full)) return full;
+        if (isExistingFile(full)) {
+          WHICH_CACHE.set(cmd, full);
+          return full;
+        }
       }
 
       const subEntries = pipe(readDirNamesResult(candidate), E.getOrElseW((): string[] => []));
@@ -338,12 +353,16 @@ function which(cmd: string): string | undefined {
 
         for (const suffix of binSuffixes) {
           const full = path.join(subPath, suffix);
-          if (isExistingFile(full)) return full;
+          if (isExistingFile(full)) {
+            WHICH_CACHE.set(cmd, full);
+            return full;
+          }
         }
       }
     }
   }
 
+  WHICH_CACHE.set(cmd, null);
   return undefined;
 }
 
@@ -391,8 +410,14 @@ function findNearestFile(startDir: string, targets: string[], stopDir: string): 
 }
 
 function findRoot(file: string, cwd: string, markers: string[]): string | undefined {
+  const cacheKey = `${file}:${cwd}`;
+  const cached = ROOT_CACHE.get(cacheKey);
+  if (cached !== undefined) return cached;
+
   const found = findNearestFile(path.dirname(file), markers, cwd);
-  return found ? path.dirname(found) : undefined;
+  const result = found ? path.dirname(found) : undefined;
+  ROOT_CACHE.set(cacheKey, result);
+  return result;
 }
 
 function timeout<T>(promise: Promise<T>, ms: number, name: string): Promise<T> {
@@ -408,6 +433,16 @@ function simpleSpawn(bin: string, args: string[] = ["--stdio"]) {
     if (!cmd) return undefined;
     return { process: spawn(cmd, args, { cwd: root, stdio: ["pipe", "pipe", "pipe"] }) };
   };
+}
+
+function findTypeScriptServerPath(root: string): string | undefined {
+  const localServerJs = path.join(root, "node_modules/typescript/lib/tsserver.js");
+  if (isExistingFile(localServerJs)) return localServerJs;
+
+  const localServerBin = path.join(root, "node_modules/.bin/tsserver");
+  if (isExistingFile(localServerBin)) return localServerBin;
+
+  return which("tsserver") || which("tsc");
 }
 
 async function spawnCheckedResult(cmd: string, args: string[], cwd: string): Promise<E.Either<SpawnProcessError, ChildProcessWithoutNullStreams>> {
@@ -686,7 +721,14 @@ export const LSP_SERVERS: LSPServerConfig[] = [
       const local = path.join(root, "node_modules/.bin/typescript-language-server");
       const cmd = fs.existsSync(local) ? local : which("typescript-language-server");
       if (!cmd) return undefined;
-      return { process: spawn(cmd, ["--stdio"], { cwd: root, stdio: ["pipe", "pipe", "pipe"] }) };
+
+      const tsserverPath = findTypeScriptServerPath(root);
+      const initOptions = tsserverPath ? { tsserver: { path: tsserverPath, fallbackPath: tsserverPath } } : undefined;
+
+      return {
+        process: spawn(cmd, ["--stdio"], { cwd: root, stdio: ["pipe", "pipe", "pipe"] }),
+        initOptions,
+      };
     },
   },
   { id: "vue", extensions: [".vue"], findRoot: (f, cwd) => findRoot(f, cwd, ["package.json", "vite.config.ts", "vite.config.js"]), spawn: simpleSpawn("vue-language-server") },
@@ -1119,22 +1161,40 @@ export class LSPManager {
     return result as DocumentSymbol[];
   }
 
+  private contentHash(text: string): string {
+    let h = 5381;
+    for (let i = 0; i < text.length; i++) {
+      h = ((h << 5) + h) ^ text.charCodeAt(i);
+    }
+    return String(h >>> 0);
+  }
+
+  /**
+   * Lightweight sync: open (once) and send didChange only when content actually changed.
+   * does NOT send didSave — callers that need analysis triggers should use openOrUpdateForAnalysis.
+   */
   private async openOrUpdate(clients: LSPClient[], absPath: string, uri: string, langId: string, content: string, evict = true) {
     const now = Date.now();
+    const hash = this.contentHash(content);
     for (const client of clients) {
       if (client.closed) continue;
       const state = client.openFiles.get(absPath);
       try {
         if (state) {
+          // Skip didChange if content hasn't changed — avoids unnecessary server analysis.
+          if (state.contentHash === hash) {
+            client.openFiles.set(absPath, { version: state.version, lastAccess: now, contentHash: hash });
+            continue;
+          }
           const v = state.version + 1;
-          client.openFiles.set(absPath, { version: v, lastAccess: now });
+          client.openFiles.set(absPath, { version: v, lastAccess: now, contentHash: hash });
           void client.connection.sendNotification(DidChangeTextDocumentNotification.type, {
             textDocument: { uri, version: v }, contentChanges: [{ text: content }],
           }).catch(() => {});
         } else {
           // For some servers (e.g. kotlin-language-server), diagnostics only start flowing after a didChange.
           // We open at version 0, then immediately send a full-content didChange at version 1.
-          client.openFiles.set(absPath, { version: 1, lastAccess: now });
+          client.openFiles.set(absPath, { version: 1, lastAccess: now, contentHash: hash });
           void client.connection.sendNotification(DidOpenTextDocumentNotification.type, {
             textDocument: { uri, languageId: langId, version: 0, text: content },
           }).catch(() => {});
@@ -1143,11 +1203,28 @@ export class LSPManager {
           }).catch(() => {});
           if (evict) this.evictLRU(client);
         }
-        // Send didSave to trigger analysis (important for TypeScript)
+        // didSave removed from the hot path — it forces extra analysis on every query.
+        // Use openOrUpdateForAnalysis below when you need diagnostics/rename readiness.
+      } catch {}
+    }
+  }
+
+  /**
+   * Full sync for analysis-heavy workflows (diagnostics, rename preflight, code actions).
+   * Opens/changes + sends didSave to trigger semantic analysis.
+   */
+  private async openOrUpdateForAnalysis(clients: LSPClient[], absPath: string, uri: string, langId: string, content: string, evict = true) {
+    await this.openOrUpdate(clients, absPath, uri, langId, content, evict);
+    const hash = this.contentHash(content);
+    for (const client of clients) {
+      if (client.closed) continue;
+      const state = client.openFiles.get(absPath);
+      if (state && state.contentHash === hash) {
+        // Already open with same content — still send didSave to trigger analysis.
         void client.connection.sendNotification(DidSaveTextDocumentNotification.type, {
           textDocument: { uri }, text: content,
         }).catch(() => {});
-      } catch {}
+      }
     }
   }
 
@@ -1204,6 +1281,78 @@ export class LSPManager {
     return O.none;
   }
 
+  private isTypeScriptLikePath(absPath: string): boolean {
+    const ext = path.extname(absPath).toLowerCase();
+    return ext === ".ts" || ext === ".tsx" || ext === ".js" || ext === ".jsx" || ext === ".mjs" || ext === ".cjs" || ext === ".mts" || ext === ".cts";
+  }
+
+  private emptyDiagnosticsSettleMs(absPath: string, timeoutMs: number): number {
+    if (!this.isTypeScriptLikePath(absPath)) return 2500;
+    return Math.min(8000, Math.max(4000, Math.min(timeoutMs - 500, Math.floor(timeoutMs * 0.8))));
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private collectCachedDiagnostics(clients: LSPClient[], absPath: string): Diagnostic[] {
+    const diags: Diagnostic[] = [];
+    for (const client of clients) {
+      const current = client.diagnostics.get(absPath);
+      if (current) diags.push(...current);
+    }
+    return diags;
+  }
+
+  private async pullAndStoreDiagnostics(clients: LSPClient[], absPath: string, uri: string): Promise<boolean> {
+    let responded = false;
+    const pulled = await Promise.all(clients.map((client) => this.pullDiagnostics(client, absPath, uri)));
+    for (let i = 0; i < clients.length; i++) {
+      const result = pulled[i];
+      if (result.responded) responded = true;
+      if (result.diagnostics.length) clients[i].diagnostics.set(absPath, result.diagnostics);
+    }
+    return responded;
+  }
+
+  private async touchAndCollectDiagnostics(
+    clients: LSPClient[],
+    absPath: string,
+    uri: string,
+    langId: string,
+    content: string,
+    timeoutMs: number,
+    evict = true,
+  ): Promise<{ responded: boolean; diagnostics: Diagnostic[] }> {
+    const isNew = clients.some((client) => !client.openFiles.has(absPath));
+    const waits = clients.map((client) => this.waitForDiagnostics(client, absPath, timeoutMs, isNew));
+    await this.openOrUpdate(clients, absPath, uri, langId, content, evict);
+    const waitResults = await Promise.all(waits);
+
+    let responded = waitResults.some((result) => result);
+    let diagnostics = this.collectCachedDiagnostics(clients, absPath);
+    if (!responded && clients.some((client) => client.diagnostics.has(absPath))) responded = true;
+
+    if (!responded || diagnostics.length === 0) {
+      if (await this.pullAndStoreDiagnostics(clients, absPath, uri)) responded = true;
+      diagnostics = this.collectCachedDiagnostics(clients, absPath);
+    }
+
+    if (responded && diagnostics.length === 0 && isNew && this.isTypeScriptLikePath(absPath)) {
+      const deadline = Date.now() + Math.min(4000, Math.max(1500, Math.floor(timeoutMs / 2)));
+      // Keep re-syncing the same content to trigger more TS analysis passes.
+      while (Date.now() < deadline) {
+        await this.sleep(400);
+        await this.openOrUpdateForAnalysis(clients, absPath, uri, langId, content, evict);
+        if (await this.pullAndStoreDiagnostics(clients, absPath, uri)) responded = true;
+        diagnostics = this.collectCachedDiagnostics(clients, absPath);
+        if (diagnostics.length > 0) break;
+      }
+    }
+
+    return { responded, diagnostics };
+  }
+
   private waitForDiagnostics(client: LSPClient, absPath: string, timeoutMs: number, isNew: boolean): Promise<boolean> {
     return new Promise(resolve => {
       if (client.closed) return resolve(false);
@@ -1240,7 +1389,7 @@ export class LSPManager {
         if (!isNew) return finish(true);
 
         if (settleTimer) clearTimeout(settleTimer);
-        settleTimer = setTimeout(() => finish(true), 2500);
+        settleTimer = setTimeout(() => finish(true), this.emptyDiagnosticsSettleMs(absPath, timeoutMs));
         (settleTimer as any).unref?.();
       };
 
@@ -1321,37 +1470,13 @@ export class LSPManager {
 
     const uri = pathToFileURL(absPath).href;
     const langId = this.langId(absPath);
-    const isNew = clients.some(c => !c.openFiles.has(absPath));
-
-    const waits = clients.map(c => this.waitForDiagnostics(c, absPath, timeoutMs, isNew));
-    await this.openOrUpdate(clients, absPath, uri, langId, content);
-    const results = await Promise.all(waits);
-
-    let responded = results.some(r => r);
-    const diags: Diagnostic[] = [];
-    for (const c of clients) {
-      const d = c.diagnostics.get(absPath);
-      if (d) diags.push(...d);
-    }
-    if (!responded && clients.some(c => c.diagnostics.has(absPath))) responded = true;
-
-    if (!responded || diags.length === 0) {
-      const pulled = await Promise.all(clients.map(c => this.pullDiagnostics(c, absPath, uri)));
-      for (let i = 0; i < clients.length; i++) {
-        const r = pulled[i];
-        if (r.responded) responded = true;
-        if (r.diagnostics.length) {
-          clients[i].diagnostics.set(absPath, r.diagnostics);
-          diags.push(...r.diagnostics);
-        }
-      }
-    }
+    const { responded, diagnostics } = await this.touchAndCollectDiagnostics(clients, absPath, uri, langId, content, timeoutMs);
 
     if (!responded) {
-      return { status: "timeout", diagnostics: diags, error: "LSP did not respond" };
+      return { status: "timeout", diagnostics, error: "LSP did not respond" };
     }
 
-    return { status: "success", diagnostics: diags };
+    return { status: "success", diagnostics };
   }
 
   async touchFileAndWait(filePath: string, timeoutMs: number): Promise<LegacyTouchFileResult> {
@@ -1390,7 +1515,6 @@ export class LSPManager {
 
       const uri = pathToFileURL(absPath).href;
       const langId = this.langId(absPath);
-      const isNew = clients.some(c => !c.openFiles.has(absPath));
 
       for (const c of clients) {
         if (!c.openFiles.has(absPath)) {
@@ -1399,34 +1523,12 @@ export class LSPManager {
         }
       }
 
-      const waits = clients.map(c => this.waitForDiagnostics(c, absPath, timeoutMs, isNew));
-      await this.openOrUpdate(clients, absPath, uri, langId, content, false);
-      const waitResults = await Promise.all(waits);
+      const { responded, diagnostics } = await this.touchAndCollectDiagnostics(clients, absPath, uri, langId, content, timeoutMs, false);
 
-      const diags: Diagnostic[] = [];
-      for (const c of clients) {
-        const d = c.diagnostics.get(absPath);
-        if (d) diags.push(...d);
-      }
-
-      let responded = waitResults.some(r => r) || diags.length > 0;
-
-      if (!responded || diags.length === 0) {
-        const pulled = await Promise.all(clients.map(c => this.pullDiagnostics(c, absPath, uri)));
-        for (let i = 0; i < clients.length; i++) {
-          const r = pulled[i];
-          if (r.responded) responded = true;
-          if (r.diagnostics.length) {
-            clients[i].diagnostics.set(absPath, r.diagnostics);
-            diags.push(...r.diagnostics);
-          }
-        }
-      }
-
-      if (!responded && !diags.length) {
+      if (!responded && !diagnostics.length) {
         results.push({ file: absPath, diagnostics: [], status: "timeout", error: "LSP did not respond" });
       } else {
-        results.push({ file: absPath, diagnostics: diags, status: "success" });
+        results.push({ file: absPath, diagnostics, status: "success" });
       }
     }
 
@@ -1516,15 +1618,26 @@ export class LSPManager {
     const loaded = await this.loadFileOption(fp);
     if (O.isNone(loaded)) return O.none;
     const l = loaded.value;
-    await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
+    // Use heavy path: open + didSave to trigger semantic analysis before rename.
+    await this.openOrUpdateForAnalysis(l.clients, l.absPath, l.uri, l.langId, l.content);
+
     const pos = this.toPos(line, col);
-    return this.firstOptionRequest(l.clients, RenameRequest.method, (client) =>
-      client.connection.sendRequest(RenameRequest.type, {
-        textDocument: { uri: l.uri },
-        position: pos,
-        newName,
-      }),
-    );
+    const deadline = Date.now() + (this.isTypeScriptLikePath(l.absPath) ? 4000 : 0);
+
+    do {
+      const result = await this.firstOptionRequest(l.clients, RenameRequest.method, (client) =>
+        client.connection.sendRequest(RenameRequest.type, {
+          textDocument: { uri: l.uri },
+          position: pos,
+          newName,
+        }),
+      );
+      if (O.isSome(result) || Date.now() >= deadline) return result;
+
+      await this.sleep(300);
+      // Re-sync same content to trigger more TS analysis passes.
+      await this.openOrUpdateForAnalysis(l.clients, l.absPath, l.uri, l.langId, l.content);
+    } while (true);
   }
 
   async rename(fp: string, line: number, col: number, newName: string): Promise<WorkspaceEdit | null> {
@@ -1538,7 +1651,8 @@ export class LSPManager {
     const loaded = await this.loadFileOption(fp);
     if (O.isNone(loaded)) return [];
     const l = loaded.value;
-    await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
+    // Use heavy path: didSave triggers deeper analysis, giving better code action context.
+    await this.openOrUpdateForAnalysis(l.clients, l.absPath, l.uri, l.langId, l.content);
 
     const start = this.toPos(startLine, startCol);
     const end = this.toPos(endLine ?? startLine, endCol ?? startCol);

@@ -14,7 +14,7 @@ process.on('uncaughtException', (err) => {
 });
 
 import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
-import { existsSync, statSync } from "fs";
+import { existsSync, statSync, readdirSync } from "fs";
 import { tmpdir } from "os";
 import { join, delimiter } from "path";
 import { LSPManager } from "../src/lsp-core.ts";
@@ -56,6 +56,11 @@ const SEARCH_PATHS = [
   `${process.env.HOME || ""}/.cargo/bin`,
 ];
 
+const MISE_NPM_BINS = [
+  `${process.env.HOME || ""}/.local/share/mise/installs`,
+  `${process.env.HOME || ""}/.npm`,
+];
+
 function commandExists(cmd: string): boolean {
   for (const dir of SEARCH_PATHS) {
     const full = join(dir, cmd);
@@ -63,6 +68,31 @@ function commandExists(cmd: string): boolean {
       if (existsSync(full) && statSync(full).isFile()) return true;
     } catch {}
   }
+
+  const suffixes = [join("bin", cmd), join("bin", `${cmd}.js`)];
+  for (const root of MISE_NPM_BINS) {
+    let entries: string[] = [];
+    try {
+      entries = readdirSync(root);
+    } catch {}
+
+    for (const entry of entries) {
+      const candidate = join(root, entry);
+      try {
+        if (!statSync(candidate).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+
+      for (const suffix of suffixes) {
+        const full = join(candidate, suffix);
+        try {
+          if (existsSync(full) && statSync(full).isFile()) return true;
+        } catch {}
+      }
+    }
+  }
+
   return false;
 }
 
