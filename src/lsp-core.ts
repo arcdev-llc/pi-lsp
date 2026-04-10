@@ -99,6 +99,47 @@ export interface WorkspaceLspSupport {
   binaryAvailable: boolean;
 }
 
+const DEFAULT_MAX_LINES = 2000;
+const DEFAULT_MAX_BYTES = 50 * 1024;
+
+export interface TruncationResult {
+  content: string;
+  truncated: boolean;
+  outputLines: number;
+  outputBytes: number;
+  totalLines: number;
+  totalBytes: number;
+}
+
+export function truncateHead(lines: string[], maxLines: number, maxBytes: number): TruncationResult {
+  const totalLines = lines.length;
+  const totalBytes = lines.reduce((acc, l) => acc + l.length + 1, 0);
+
+  const outputLines: string[] = [];
+  let outputBytes = 0;
+  let truncated = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineBytes = line.length + 1;
+    if (outputLines.length >= maxLines || outputBytes + lineBytes > maxBytes) {
+      truncated = true;
+      break;
+    }
+    outputLines.push(line);
+    outputBytes += lineBytes;
+  }
+
+  return {
+    content: outputLines.join("\n"),
+    truncated,
+    outputLines: outputLines.length,
+    outputBytes,
+    totalLines,
+    totalBytes,
+  };
+}
+
 // Utilities
 const SEARCH_PATHS = [
   ...(process.env.PATH?.split(path.delimiter) || []),
@@ -107,12 +148,58 @@ const SEARCH_PATHS = [
   `${process.env.HOME}/go/bin`, `${process.env.HOME}/.cargo/bin`,
 ];
 
+// Extra search roots for mise-managed node installs
+const MISE_NPM_BINS = [
+  `${process.env.HOME}/.local/share/mise/installs`,
+  `${process.env.HOME}/.npm`,
+];
+
 function which(cmd: string): string | undefined {
   const ext = process.platform === "win32" ? ".exe" : "";
+
+  // Fast path: PATH dirs
   for (const dir of SEARCH_PATHS) {
     const full = path.join(dir, cmd + ext);
     try { if (fs.existsSync(full) && fs.statSync(full).isFile()) return full; } catch {}
   }
+
+  // Slow path: scan mise node install trees for bin/ links
+  const binSuffixes = [`bin/${cmd}`, `bin/${cmd}.js`, `bin/${cmd}${ext}`];
+  for (const root of MISE_NPM_BINS) {
+    let entries: string[];
+    try { entries = fs.readdirSync(root); } catch { continue; }
+    for (const entry of entries) {
+      const candidate = path.join(root, entry);
+      let stat: fs.Stats;
+      try { stat = fs.statSync(candidate); } catch { continue; }
+      if (!stat.isDirectory()) continue;
+
+      // Check bin/ at root level (flat installs like mise tools)
+      for (const suffix of binSuffixes) {
+        const full = path.join(candidate, suffix);
+        try { if (fs.existsSync(full) && fs.statSync(full).isFile()) return full; } catch {}
+      }
+
+      // Check bin/ inside version subdirs (mise node/npm installs: <pkg>/<version>/bin/)
+      let subEntries: string[];
+      try { subEntries = fs.readdirSync(candidate); } catch { continue; }
+      for (const sub of subEntries) {
+        // Skip hidden/system dirs and manifest files
+        if (sub.startsWith(".") || sub === "node_modules" || sub === "package.json" || sub === "bun.lock") continue;
+        const subPath = path.join(candidate, sub);
+        let subStat: fs.Stats;
+        try { subStat = fs.statSync(subPath); } catch { continue; }
+        if (!subStat.isDirectory()) continue;
+
+        for (const suffix of binSuffixes) {
+          const full = path.join(subPath, suffix);
+          try { if (fs.existsSync(full) && fs.statSync(full).isFile()) return full; } catch {}
+        }
+      }
+    }
+  }
+
+  return undefined;
 }
 
 function normalizeFsPath(p: string): string {

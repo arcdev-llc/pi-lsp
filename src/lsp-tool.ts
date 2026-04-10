@@ -28,11 +28,13 @@ import { Type, type Static } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import { getOrCreateManager, formatDiagnostic, filterDiagnosticsBySeverity, uriToPath, resolvePosition, collectSymbols, inspectWorkspaceLsp, type SeverityFilter } from "./lsp-core.js";
+import { getOrCreateManager, formatDiagnostic, filterDiagnosticsBySeverity, uriToPath, resolvePosition, collectSymbols, inspectWorkspaceLsp, truncateHead, type SeverityFilter } from "./lsp-core.js";
 
 const PREVIEW_LINES = 10;
 
 const DIAGNOSTICS_WAIT_MS_DEFAULT = 3000;
+const SYMBOLS_MAX_LINES = 200;
+const SYMBOLS_MAX_BYTES = 30 * 1024;
 
 function diagnosticsWaitMsForFile(filePath: string): number {
   const ext = path.extname(filePath).toLowerCase();
@@ -296,12 +298,20 @@ Actions: status, definition, references, hover, signature, rename (require file 
             const payload = result ? formatHover(result.contents) || "No hover information." : "No hover information.";
             return { content: [{ type: "text", text: `action: hover\n${qLine}${posLine}${payload}` }], details: result ?? null };
           }
-          case "symbols": {
-            const symbols = await abortable(manager.getDocumentSymbols(file!), signal);
-            const lines = collectSymbols(symbols, 0, [], query);
-            const payload = lines.length ? lines.join("\n") : query ? `No symbols matching "${query}".` : "No symbols found.";
-            return { content: [{ type: "text", text: `action: symbols\n${qLine}${payload}` }], details: symbols };
-          }
+          case "symbols":
+            {
+              const symbols = await abortable(manager.getDocumentSymbols(file!), signal);
+              const lines = collectSymbols(symbols, 0, [], query);
+              const truncated = truncateHead(lines, SYMBOLS_MAX_LINES, SYMBOLS_MAX_BYTES);
+              let payload: string;
+              if (truncated.truncated) {
+                payload = truncated.content;
+                payload += `\n\n[Truncated: ${truncated.outputLines} of ${truncated.totalLines} symbol lines shown. Use a narrower query to filter results.]`;
+              } else {
+                payload = lines.length ? lines.join("\n") : query ? `No symbols matching "${query}".` : "No symbols found.";
+              }
+              return { content: [{ type: "text", text: `action: symbols\n${qLine}${payload}` }], details: symbols };
+            }
           case "diagnostics": {
             const result = await abortable(manager.touchFileAndWait(file!, diagnosticsWaitMsForFile(file!)), signal);
             const filtered = filterDiagnosticsBySeverity(result.diagnostics, sevFilter);
@@ -334,7 +344,11 @@ Actions: status, definition, references, hover, signature, rename (require file 
             }
 
             const summary = `Analyzed ${result.items.length} file(s): ${errors} error(s), ${warnings} warning(s) in ${filesWithIssues} file(s)`;
-            return { content: [{ type: "text", text: `action: workspace-diagnostics\n${sevLine}${summary}\n\n${out.length ? out.join("\n") : "No diagnostics."}` }], details: result };
+            const truncated = truncateHead(out, 500, 40 * 1024);
+            const diagnosticsText = truncated.truncated
+              ? truncated.content + `\n\n[Truncated: ${truncated.outputLines} of ${truncated.totalLines} diagnostic lines. Use severity filter or fewer files to reduce output.]`
+              : (out.length ? out.join("\n") : "No diagnostics.");
+            return { content: [{ type: "text", text: `action: workspace-diagnostics\n${sevLine}${summary}\n\n${diagnosticsText}` }], details: result };
           }
           case "signature": {
             const result = await abortable(manager.getSignatureHelp(file!, rLine!, rCol!), signal);
