@@ -91,6 +91,14 @@ export interface FileDiagnosticItem {
 
 export interface FileDiagnosticsResult { items: FileDiagnosticItem[]; }
 
+export interface WorkspaceLspSupport {
+  serverId: string;
+  language: string;
+  root: string;
+  binary: string;
+  binaryAvailable: boolean;
+}
+
 // Utilities
 const SEARCH_PATHS = [
   ...(process.env.PATH?.split(path.delimiter) || []),
@@ -115,6 +123,33 @@ function normalizeFsPath(p: string): string {
   } catch {
     return p;
   }
+}
+
+function dirHasExtension(root: string, exts: string[], maxDepth = 3): boolean {
+  const ignored = new Set([".git", ".pi", "node_modules", "dist", "build", "target", ".next", ".turbo"]);
+
+  const visit = (dir: string, depth: number): boolean => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (depth <= 0 || ignored.has(entry.name)) continue;
+        if (visit(path.join(dir, entry.name), depth - 1)) return true;
+        continue;
+      }
+
+      if (exts.includes(path.extname(entry.name).toLowerCase())) return true;
+    }
+
+    return false;
+  };
+
+  return visit(root, maxDepth);
 }
 
 function findNearestFile(startDir: string, targets: string[], stopDir: string): string | undefined {
@@ -441,6 +476,116 @@ export async function shutdownManager(): Promise<void> {
   managerCwd = null;
 
   await manager.shutdown();
+}
+
+const SERVER_LABELS: Record<string, string> = {
+  dart: "Dart/Flutter",
+  typescript: "TypeScript/JavaScript",
+  vue: "Vue",
+  svelte: "Svelte",
+  pyright: "Python",
+  gopls: "Go",
+  kotlin: "Kotlin",
+  swift: "Swift",
+  "rust-analyzer": "Rust",
+};
+
+function expectedServerBinary(serverId: string): string {
+  switch (serverId) {
+    case "dart":
+      return "dart";
+    case "typescript":
+      return "typescript-language-server";
+    case "vue":
+      return "vue-language-server";
+    case "svelte":
+      return "svelteserver";
+    case "pyright":
+      return "pyright-langserver";
+    case "gopls":
+      return "gopls";
+    case "kotlin":
+      return "kotlin-lsp";
+    case "swift":
+      return "sourcekit-lsp";
+    case "rust-analyzer":
+      return "rust-analyzer";
+    default:
+      return serverId;
+  }
+}
+
+function workspaceLikelyUsesServer(serverId: string, root: string): boolean {
+  switch (serverId) {
+    case "typescript":
+      return fs.existsSync(path.join(root, "tsconfig.json"))
+        || fs.existsSync(path.join(root, "jsconfig.json"))
+        || dirHasExtension(root, [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"]);
+    case "vue":
+      return fs.existsSync(path.join(root, "vite.config.ts"))
+        || fs.existsSync(path.join(root, "vite.config.js"))
+        || dirHasExtension(root, [".vue"]);
+    case "svelte":
+      return fs.existsSync(path.join(root, "svelte.config.js"))
+        || dirHasExtension(root, [".svelte"]);
+    default:
+      return true;
+  }
+}
+
+function findServerBinary(serverId: string, root: string): string | undefined {
+  switch (serverId) {
+    case "dart":
+      return which("dart") || which("flutter");
+    case "typescript": {
+      const local = path.join(root, "node_modules/.bin/typescript-language-server");
+      return fs.existsSync(local) ? local : which("typescript-language-server");
+    }
+    case "vue":
+      return which("vue-language-server");
+    case "svelte":
+      return which("svelteserver");
+    case "pyright":
+      return which("pyright-langserver");
+    case "gopls":
+      return which("gopls");
+    case "kotlin":
+      return which("kotlin-lsp") || which("kotlin-lsp.sh") || which("kotlin-lsp.cmd") || process.env.PI_LSP_KOTLIN_LSP_PATH || which("kotlin-language-server");
+    case "swift":
+      return which("sourcekit-lsp") || which("xcrun");
+    case "rust-analyzer":
+      return which("rust-analyzer");
+    default:
+      return undefined;
+  }
+}
+
+export function inspectWorkspaceLsp(cwd: string): WorkspaceLspSupport[] {
+  const seen = new Set<string>();
+  const found: WorkspaceLspSupport[] = [];
+
+  for (const config of LSP_SERVERS) {
+    const probeExt = config.extensions[0];
+    if (!probeExt) continue;
+    const root = config.findRoot(path.join(cwd, `__pi_lsp_probe__${probeExt}`), cwd);
+    if (!root) continue;
+
+    const key = `${config.id}:${root}`;
+    if (seen.has(key)) continue;
+    if (!workspaceLikelyUsesServer(config.id, root)) continue;
+    seen.add(key);
+
+    const binaryPath = findServerBinary(config.id, root);
+    found.push({
+      serverId: config.id,
+      language: SERVER_LABELS[config.id] || config.id,
+      root,
+      binary: binaryPath ? path.basename(binaryPath) : expectedServerBinary(config.id),
+      binaryAvailable: !!binaryPath,
+    });
+  }
+
+  return found;
 }
 
 // LSP Manager

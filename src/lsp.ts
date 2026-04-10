@@ -17,7 +17,7 @@ import * as os from "node:os";
 import { type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { type Diagnostic } from "vscode-languageserver-protocol";
-import { LSP_SERVERS, formatDiagnostic, getOrCreateManager, shutdownManager } from "./lsp-core.js";
+import { LSP_SERVERS, formatDiagnostic, getOrCreateManager, inspectWorkspaceLsp, shutdownManager } from "./lsp-core.js";
 
 type HookScope = "session" | "global";
 type HookMode = "edit_write" | "agent_end" | "disabled";
@@ -189,6 +189,14 @@ export default function (pi: ExtensionAPI) {
       .replace(/<\/?file_diagnostics>\n?/gi, "")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
+  }
+
+  function getLspSystemPromptHint(cwd: string): string | undefined {
+    const detected = inspectWorkspaceLsp(cwd).filter((item) => item.binaryAvailable);
+    if (!detected.length) return undefined;
+
+    const languages = [...new Set(detected.map((item) => item.language))].join(", ");
+    return `LSP is available in this workspace for ${languages}. Prefer the lsp tool for symbol-aware tasks like definition lookup, references, hover/type info, rename, code actions, and diagnostics. If the file path is unknown, use bash/read first to find candidate files. You can call \`lsp\` with action=\`status\` to inspect detected support.`;
   }
 
   function setActivity(next: LspActivity): void {
@@ -447,6 +455,14 @@ export default function (pi: ExtensionAPI) {
         break;
       }
     }
+  });
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    const hint = getLspSystemPromptHint(ctx.cwd);
+    if (!hint) return;
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n${hint}`,
+    };
   });
 
   pi.on("session_switch", async (_event, ctx) => {

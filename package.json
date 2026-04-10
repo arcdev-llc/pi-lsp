@@ -1,7 +1,7 @@
 {
     "name": "@arcdev-llc/pi-lsp",
     "version": "1.0.4",
-    "description": "LSP extension for pi-coding-agent - provides language server tool and diagnostics feedback for Dart/Flutter, TypeScript, Vue, Svelte, Python, Go, Kotlin, Swift, Rust",
+    "description": "Semantic code navigation, diagnostics, and refactoring for pi via Language Server Protocol (definition, references, hover, rename, code actions, workspace diagnostics) across Dart/Flutter, TypeScript, Vue, Svelte, Python, Go, Kotlin, Swift, and Rust",
     "scripts": {
         "build": "rslib build",
         "publish:github": "npm publish",
@@ -27,13 +27,22 @@
         "rust",
         "pi-coding-agent",
         "extension",
-        "pi-package"
+        "pi-package",
+        "go-to-definition",
+        "find-references",
+        "rename-symbol",
+        "diagnostics",
+        "code-actions",
+        "semantic-navigation",
+        "refactoring",
+        "type-information"
     ],
     "author": "",
     "license": "MIT",
     "type": "module",
     "files": [
         "dist",
+        "skills",
         "README.md"
     ],
     "main": "./dist/lsp.js",
@@ -45,6 +54,9 @@
         "extensions": [
             "./dist/lsp.js",
             "./dist/lsp-tool.js"
+        ],
+        "skills": [
+            "./skills"
         ]
     },
     "dependencies": {

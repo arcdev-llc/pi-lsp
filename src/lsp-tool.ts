@@ -28,7 +28,7 @@ import { Type, type Static } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import { getOrCreateManager, formatDiagnostic, filterDiagnosticsBySeverity, uriToPath, resolvePosition, collectSymbols, type SeverityFilter } from "./lsp-core.js";
+import { getOrCreateManager, formatDiagnostic, filterDiagnosticsBySeverity, uriToPath, resolvePosition, collectSymbols, inspectWorkspaceLsp, type SeverityFilter } from "./lsp-core.js";
 
 const PREVIEW_LINES = 10;
 
@@ -42,7 +42,7 @@ function diagnosticsWaitMsForFile(filePath: string): number {
   return DIAGNOSTICS_WAIT_MS_DEFAULT;
 }
 
-const ACTIONS = ["definition", "references", "hover", "symbols", "diagnostics", "workspace-diagnostics", "signature", "rename", "codeAction"] as const;
+const ACTIONS = ["status", "definition", "references", "hover", "symbols", "diagnostics", "workspace-diagnostics", "signature", "rename", "codeAction"] as const;
 const SEVERITY_FILTERS = ["all", "error", "warning", "info", "hint"] as const;
 
 const LspParams = Type.Object({
@@ -209,22 +209,32 @@ function formatCodeActions(actions: any[]): string[] {
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.registerTool({
+  // Cast for compatibility with older pi type definitions that do not yet include
+  // promptSnippet / promptGuidelines, while newer runtimes use them in the system prompt.
+  pi.registerTool(({
     name: "lsp",
     label: "LSP",
-    description: `Query language server for definitions, references, types, symbols, diagnostics, rename, and code actions.
+    description: `Use this tool for semantic code navigation, diagnostics, and refactoring when symbol awareness matters.
 
-Actions: definition, references, hover, signature, rename (require file + line/column or query), symbols (file, optional query), diagnostics (file), workspace-diagnostics (files array), codeAction (file + position).
-Use bash to find files: find src -name "*.ts" -type f`,
+Best for: go to definition, find references, hover/type info, list symbols, rename, diagnostics, and code actions. Prefer this over grep/read when the task is about symbols or language-server-backed analysis. If the file path is unknown, use bash or read first to locate candidate files.
+
+Actions: status, definition, references, hover, signature, rename (require file + line/column or query), symbols (file, optional query), diagnostics (file), workspace-diagnostics (files array), codeAction (file + position).`,
+    promptSnippet: "Use for semantic code navigation, symbol lookup, diagnostics, rename, and code actions via language servers.",
+    promptGuidelines: [
+      "Use lsp instead of grep/read when the task is symbol-aware: definition, references, hover/type info, rename, diagnostics, or code actions.",
+      "If the target file is unknown, use bash/read first to locate likely files, then call lsp.",
+      "After code edits, prefer lsp diagnostics or workspace-diagnostics to validate changes in supported projects.",
+      "If lsp reports unsupported or times out, fall back to read/bash and explain the limitation.",
+    ],
     parameters: LspParams,
 
-    async execute(_toolCallId, params, signalArg, onUpdateArg, ctxArg) {
+    async execute(_toolCallId: string, params: LspParamsType, signalArg: unknown, onUpdateArg: unknown, ctxArg: unknown) {
       const { signal, onUpdate, ctx } = normalizeExecuteArgs(onUpdateArg, ctxArg, signalArg);
       if (signal?.aborted) return cancelledToolResult();
       const manager = getOrCreateManager(ctx.cwd);
       const { action, file, files, line, column, endLine, endColumn, query, newName, severity } = params as LspParamsType;
       const sevFilter: SeverityFilter = severity || "all";
-      const needsFile = action !== "workspace-diagnostics";
+      const needsFile = action !== "workspace-diagnostics" && action !== "status";
       const needsPos = ["definition", "references", "hover", "signature", "rename", "codeAction"].includes(action);
 
       try {
@@ -244,6 +254,32 @@ Use bash to find files: find src -name "*.ts" -type f`,
         const posLine = fromQuery && rLine && rCol ? `resolvedPosition: ${rLine}:${rCol}\n` : "";
 
         switch (action) {
+          case "status": {
+            const support = inspectWorkspaceLsp(ctx.cwd);
+            if (!support.length) {
+              return {
+                content: [{
+                  type: "text",
+                  text: "action: status\nNo supported LSP workspace detected from the current cwd. If the project lives in a subdirectory, cd there first or use bash/read to inspect the repo layout.",
+                }],
+                details: { support: [] },
+              };
+            }
+
+            const lines = support.map((item) => {
+              const displayRoot = path.relative(ctx.cwd, item.root) || ".";
+              const availability = item.binaryAvailable ? `binary: ${item.binary}` : `binary missing: expected ${item.binary}`;
+              return `- ${item.language} (${item.serverId})\n  root: ${displayRoot}\n  ${availability}`;
+            });
+
+            return {
+              content: [{
+                type: "text",
+                text: `action: status\nDetected ${support.length} LSP workspace(s):\n${lines.join("\n")}`,
+              }],
+              details: { support },
+            };
+          }
           case "definition": {
             const results = await abortable(manager.getDefinition(file!, rLine!, rCol!), signal);
             const locs = results.map(l => formatLocation(l, ctx?.cwd));
@@ -323,7 +359,7 @@ Use bash to find files: find src -name "*.ts" -type f`,
       }
     },
 
-    renderCall(args, theme) {
+    renderCall(args: LspParamsType, theme: any) {
       const params = args as LspParamsType;
       let text = theme.fg("toolTitle", theme.bold("lsp ")) + theme.fg("accent", params.action || "...");
       if (params.file) text += " " + theme.fg("muted", params.file);
@@ -334,7 +370,7 @@ Use bash to find files: find src -name "*.ts" -type f`,
       return new Text(text, 0, 0);
     },
 
-    renderResult(result, options, theme) {
+    renderResult(result: any, options: any, theme: any) {
       if (options.isPartial) return new Text("", 0, 0);
 
       const textContent = (result.content?.find((c: any) => c.type === "text") as any)?.text || "";
@@ -361,5 +397,5 @@ Use bash to find files: find src -name "*.ts" -type f`,
 
       return new Text(out, 0, 0);
     },
-  });
+  } as any));
 }

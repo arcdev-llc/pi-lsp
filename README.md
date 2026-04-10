@@ -10,6 +10,26 @@ Language Server Protocol integration for pi-coding-agent.
 - **Efficient**: Bounded memory usage via LRU cache and idle file cleanup
 - Supports TypeScript/JavaScript, Vue, Svelte, Dart/Flutter, Python, Go, Kotlin, Swift, and Rust
 
+## For Agents
+
+Prefer the `lsp` tool when the task is semantic rather than textual.
+
+Use `lsp` for:
+- go to definition
+- find references
+- hover/type info
+- safe rename
+- code actions
+- diagnostics after edits
+
+Recommended workflow:
+1. `lsp action=status` to inspect detected support
+2. If the file is unknown, use `bash`/`read` to locate likely files
+3. Use `lsp` for symbol-aware queries and refactors
+4. After edits, run `lsp action=diagnostics` or `lsp action=workspace-diagnostics`
+
+If LSP is unsupported or times out, fall back to `bash`/`read` and explain the limitation.
+
 ## Supported Languages
 
 | Language | Server | Detection |
@@ -91,6 +111,7 @@ The `lsp` tool provides these actions:
 
 | Action | Description | Requires |
 |--------|-------------|----------|
+| `status` | Show detected LSP workspace support and binary availability | none |
 | `definition` | Jump to definition | `file` + (`line`/`column` or `query`) |
 | `references` | Find all references | `file` + (`line`/`column` or `query`) |
 | `hover` | Get type/docs info | `file` + (`line`/`column` or `query`) |
