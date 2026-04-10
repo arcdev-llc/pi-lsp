@@ -9,7 +9,8 @@
         "test:tool": "npx tsx tests/index.test.ts",
         "test:integration": "npx tsx tests/lsp-integration.test.ts",
         "test:all": "npm test && npm run test:tool && npm run test:integration",
-        "prepublishOnly": "npm run build"
+        "prepublishOnly": "npm run build",
+        "postinstall": "npm run build"
     },
     "keywords": [
         "lsp",
