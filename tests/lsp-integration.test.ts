@@ -17,7 +17,7 @@ import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
 import { existsSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join, delimiter } from "path";
-import { LSPManager } from "../lsp-core.js";
+import { LSPManager } from "../src/lsp-core.ts";
 
 // ============================================================================
 // Test utilities

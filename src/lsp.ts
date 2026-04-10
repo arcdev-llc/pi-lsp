@@ -347,8 +347,8 @@ export default function (pi: ExtensionAPI) {
     if (!absPath) return undefined;
 
     try {
-      const result = await manager.touchFileAndWait(absPath, diagnosticsWaitMsForFile(absPath));
-      if (!result.receivedResponse) return undefined;
+      const result = await manager.touchFileAndWaitResult(absPath, diagnosticsWaitMsForFile(absPath));
+      if (result.status !== "success") return undefined;
 
       const diagnostics = includeWarnings
         ? result.diagnostics

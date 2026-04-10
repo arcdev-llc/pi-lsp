@@ -6,6 +6,10 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import { pathToFileURL, fileURLToPath } from "node:url";
+import * as E from "fp-ts/lib/Either.js";
+import * as O from "fp-ts/lib/Option.js";
+import * as TE from "fp-ts/lib/TaskEither.js";
+import { pipe } from "fp-ts/lib/function.js";
 import {
   createMessageConnection,
   StreamMessageReader,
@@ -91,6 +95,66 @@ export interface FileDiagnosticItem {
 
 export interface FileDiagnosticsResult { items: FileDiagnosticItem[]; }
 
+export type FileDiagnosticsItemResult =
+  | { file: string; diagnostics: Diagnostic[]; status: "success" }
+  | { file: string; diagnostics: Diagnostic[]; status: "timeout"; error: string }
+  | { file: string; diagnostics: Diagnostic[]; status: "unsupported"; error: string }
+  | { file: string; diagnostics: Diagnostic[]; status: "error"; error: string };
+
+export interface FileDiagnosticsResultV2 { items: FileDiagnosticsItemResult[]; }
+
+interface LoadedFileContext {
+  clients: LSPClient[];
+  absPath: string;
+  uri: string;
+  langId: string;
+  content: string;
+}
+
+interface SpawnProcessError {
+  _tag: "SpawnProcessError";
+  cmd: string;
+  args: string[];
+  cwd: string;
+  reason: "spawn_exception" | "process_exit" | "process_error" | "all_variants_failed";
+  cause?: unknown;
+}
+
+interface InitClientError {
+  _tag: "InitClientError";
+  serverId: string;
+  root: string;
+  phase: "spawn" | "initialize";
+  cause?: unknown;
+}
+
+interface RequestExecutionError {
+  _tag: "RequestExecutionError";
+  method: string;
+  root: string;
+  cause?: unknown;
+}
+
+interface FsProbeError {
+  _tag: "FsProbeError";
+  operation: "stat" | "readdir" | "realpath" | "readFile";
+  path: string;
+  cause?: unknown;
+}
+
+export type TouchFileDiagnosticsResult =
+  | { status: "success"; diagnostics: Diagnostic[] }
+  | { status: "timeout"; diagnostics: Diagnostic[]; error: string }
+  | { status: "unsupported"; diagnostics: Diagnostic[]; error: string }
+  | { status: "error"; diagnostics: Diagnostic[]; error: string };
+
+export interface LegacyTouchFileResult {
+  diagnostics: Diagnostic[];
+  receivedResponse: boolean;
+  unsupported?: boolean;
+  error?: string;
+}
+
 export interface WorkspaceLspSupport {
   serverId: string;
   language: string;
@@ -109,6 +173,36 @@ export interface TruncationResult {
   outputBytes: number;
   totalLines: number;
   totalBytes: number;
+}
+
+export function toLegacyTouchFileResult(result: TouchFileDiagnosticsResult): LegacyTouchFileResult {
+  switch (result.status) {
+    case "success":
+      return { diagnostics: result.diagnostics, receivedResponse: true };
+    case "timeout":
+      return { diagnostics: result.diagnostics, receivedResponse: false, error: result.error };
+    case "unsupported":
+      return { diagnostics: result.diagnostics, receivedResponse: false, unsupported: true, error: result.error };
+    case "error":
+      return { diagnostics: result.diagnostics, receivedResponse: false, error: result.error };
+  }
+}
+
+export function toLegacyFileDiagnosticItem(result: FileDiagnosticsItemResult): FileDiagnosticItem {
+  switch (result.status) {
+    case "success":
+      return { file: result.file, diagnostics: result.diagnostics, status: "ok" };
+    case "timeout":
+      return { file: result.file, diagnostics: result.diagnostics, status: "timeout", error: result.error };
+    case "unsupported":
+      return { file: result.file, diagnostics: result.diagnostics, status: "unsupported", error: result.error };
+    case "error":
+      return { file: result.file, diagnostics: result.diagnostics, status: "error", error: result.error };
+  }
+}
+
+export function toLegacyFileDiagnosticsResult(result: FileDiagnosticsResultV2): FileDiagnosticsResult {
+  return { items: result.items.map(toLegacyFileDiagnosticItem) };
 }
 
 export function truncateHead(lines: string[], maxLines: number, maxBytes: number): TruncationResult {
@@ -154,46 +248,97 @@ const MISE_NPM_BINS = [
   `${process.env.HOME}/.npm`,
 ];
 
+function statPathResult(targetPath: string): E.Either<FsProbeError, fs.Stats> {
+  return E.tryCatch(
+    () => fs.statSync(targetPath),
+    (cause): FsProbeError => ({ _tag: "FsProbeError", operation: "stat", path: targetPath, cause }),
+  );
+}
+
+function readDirNamesResult(dirPath: string): E.Either<FsProbeError, string[]> {
+  return E.tryCatch(
+    () => fs.readdirSync(dirPath),
+    (cause): FsProbeError => ({ _tag: "FsProbeError", operation: "readdir", path: dirPath, cause }),
+  );
+}
+
+function readDirentsResult(dirPath: string): E.Either<FsProbeError, fs.Dirent[]> {
+  return E.tryCatch(
+    () => fs.readdirSync(dirPath, { withFileTypes: true }),
+    (cause): FsProbeError => ({ _tag: "FsProbeError", operation: "readdir", path: dirPath, cause }),
+  );
+}
+
+function realPathResult(targetPath: string): E.Either<FsProbeError, string> {
+  return E.tryCatch(
+    () => {
+      const fn: any = (fs as any).realpathSync?.native || fs.realpathSync;
+      return fn(targetPath);
+    },
+    (cause): FsProbeError => ({ _tag: "FsProbeError", operation: "realpath", path: targetPath, cause }),
+  );
+}
+
+function readUtf8FileResult(filePath: string): E.Either<FsProbeError, string> {
+  return E.tryCatch(
+    () => fs.readFileSync(filePath, "utf-8"),
+    (cause): FsProbeError => ({ _tag: "FsProbeError", operation: "readFile", path: filePath, cause }),
+  );
+}
+
+function isExistingFile(targetPath: string): boolean {
+  return pipe(
+    statPathResult(targetPath),
+    E.match(
+      () => false,
+      (stat) => stat.isFile(),
+    ),
+  );
+}
+
+function isExistingDirectory(targetPath: string): boolean {
+  return pipe(
+    statPathResult(targetPath),
+    E.match(
+      () => false,
+      (stat) => stat.isDirectory(),
+    ),
+  );
+}
+
+function pathExists(targetPath: string): boolean {
+  return E.isRight(statPathResult(targetPath));
+}
+
 function which(cmd: string): string | undefined {
   const ext = process.platform === "win32" ? ".exe" : "";
 
-  // Fast path: PATH dirs
   for (const dir of SEARCH_PATHS) {
     const full = path.join(dir, cmd + ext);
-    try { if (fs.existsSync(full) && fs.statSync(full).isFile()) return full; } catch {}
+    if (isExistingFile(full)) return full;
   }
 
-  // Slow path: scan mise node install trees for bin/ links
   const binSuffixes = [`bin/${cmd}`, `bin/${cmd}.js`, `bin/${cmd}${ext}`];
   for (const root of MISE_NPM_BINS) {
-    let entries: string[];
-    try { entries = fs.readdirSync(root); } catch { continue; }
+    const entries = pipe(readDirNamesResult(root), E.getOrElseW((): string[] => []));
     for (const entry of entries) {
       const candidate = path.join(root, entry);
-      let stat: fs.Stats;
-      try { stat = fs.statSync(candidate); } catch { continue; }
-      if (!stat.isDirectory()) continue;
+      if (!isExistingDirectory(candidate)) continue;
 
-      // Check bin/ at root level (flat installs like mise tools)
       for (const suffix of binSuffixes) {
         const full = path.join(candidate, suffix);
-        try { if (fs.existsSync(full) && fs.statSync(full).isFile()) return full; } catch {}
+        if (isExistingFile(full)) return full;
       }
 
-      // Check bin/ inside version subdirs (mise node/npm installs: <pkg>/<version>/bin/)
-      let subEntries: string[];
-      try { subEntries = fs.readdirSync(candidate); } catch { continue; }
+      const subEntries = pipe(readDirNamesResult(candidate), E.getOrElseW((): string[] => []));
       for (const sub of subEntries) {
-        // Skip hidden/system dirs and manifest files
         if (sub.startsWith(".") || sub === "node_modules" || sub === "package.json" || sub === "bun.lock") continue;
         const subPath = path.join(candidate, sub);
-        let subStat: fs.Stats;
-        try { subStat = fs.statSync(subPath); } catch { continue; }
-        if (!subStat.isDirectory()) continue;
+        if (!isExistingDirectory(subPath)) continue;
 
         for (const suffix of binSuffixes) {
           const full = path.join(subPath, suffix);
-          try { if (fs.existsSync(full) && fs.statSync(full).isFile()) return full; } catch {}
+          if (isExistingFile(full)) return full;
         }
       }
     }
@@ -203,25 +348,17 @@ function which(cmd: string): string | undefined {
 }
 
 function normalizeFsPath(p: string): string {
-  try {
-    // realpathSync.native is faster on some platforms, but not always present
-    const fn: any = (fs as any).realpathSync?.native || fs.realpathSync;
-    return fn(p);
-  } catch {
-    return p;
-  }
+  return pipe(
+    realPathResult(p),
+    E.getOrElseW(() => p),
+  );
 }
 
 function dirHasExtension(root: string, exts: string[], maxDepth = 3): boolean {
   const ignored = new Set([".git", ".pi", "node_modules", "dist", "build", "target", ".next", ".turbo"]);
 
   const visit = (dir: string, depth: number): boolean => {
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return false;
-    }
+    const entries = pipe(readDirentsResult(dir), E.getOrElseW((): fs.Dirent[] => []));
 
     for (const entry of entries) {
       if (entry.isDirectory()) {
@@ -245,7 +382,7 @@ function findNearestFile(startDir: string, targets: string[], stopDir: string): 
   while (current.length >= stop.length) {
     for (const t of targets) {
       const candidate = path.join(current, t);
-      if (fs.existsSync(candidate)) return candidate;
+      if (pathExists(candidate)) return candidate;
     }
     const parent = path.dirname(current);
     if (parent === current) break;
@@ -273,11 +410,10 @@ function simpleSpawn(bin: string, args: string[] = ["--stdio"]) {
   };
 }
 
-async function spawnChecked(cmd: string, args: string[], cwd: string): Promise<ChildProcessWithoutNullStreams | undefined> {
+async function spawnCheckedResult(cmd: string, args: string[], cwd: string): Promise<E.Either<SpawnProcessError, ChildProcessWithoutNullStreams>> {
   try {
     const child = spawn(cmd, args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
 
-    // If the process exits immediately (e.g. unsupported flag), treat it as a failure
     return await new Promise((resolve) => {
       let settled = false;
 
@@ -288,7 +424,7 @@ async function spawnChecked(cmd: string, args: string[], cwd: string): Promise<C
 
       let timer: NodeJS.Timeout | null = null;
 
-      const finish = (value: ChildProcessWithoutNullStreams | undefined) => {
+      const finish = (value: E.Either<SpawnProcessError, ChildProcessWithoutNullStreams>) => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
@@ -296,26 +432,70 @@ async function spawnChecked(cmd: string, args: string[], cwd: string): Promise<C
         resolve(value);
       };
 
-      const onExit = () => finish(undefined);
-      const onError = () => finish(undefined);
+      const onExit = () => finish(E.left({
+        _tag: "SpawnProcessError",
+        cmd,
+        args,
+        cwd,
+        reason: "process_exit",
+      }));
+      const onError = (cause: unknown) => finish(E.left({
+        _tag: "SpawnProcessError",
+        cmd,
+        args,
+        cwd,
+        reason: "process_error",
+        cause,
+      }));
 
       child.once("exit", onExit);
       child.once("error", onError);
 
-      timer = setTimeout(() => finish(child), 200);
+      timer = setTimeout(() => finish(E.right(child)), 200);
       (timer as any).unref?.();
     });
-  } catch {
-    return undefined;
+  } catch (cause) {
+    return E.left({
+      _tag: "SpawnProcessError",
+      cmd,
+      args,
+      cwd,
+      reason: "spawn_exception",
+      cause,
+    });
   }
 }
 
-async function spawnWithFallback(cmd: string, argsVariants: string[][], cwd: string): Promise<ChildProcessWithoutNullStreams | undefined> {
+async function spawnChecked(cmd: string, args: string[], cwd: string): Promise<ChildProcessWithoutNullStreams | undefined> {
+  return pipe(
+    await spawnCheckedResult(cmd, args, cwd),
+    E.getOrElseW((): ChildProcessWithoutNullStreams | undefined => undefined),
+  );
+}
+
+async function spawnWithFallbackResult(cmd: string, argsVariants: string[][], cwd: string): Promise<E.Either<SpawnProcessError, ChildProcessWithoutNullStreams>> {
+  let lastError: SpawnProcessError | undefined;
+
   for (const args of argsVariants) {
-    const child = await spawnChecked(cmd, args, cwd);
-    if (child) return child;
+    const child = await spawnCheckedResult(cmd, args, cwd);
+    if (E.isRight(child)) return child;
+    lastError = child.left;
   }
-  return undefined;
+
+  return E.left(lastError ?? {
+    _tag: "SpawnProcessError",
+    cmd,
+    args: [],
+    cwd,
+    reason: "all_variants_failed",
+  });
+}
+
+async function spawnWithFallback(cmd: string, argsVariants: string[][], cwd: string): Promise<ChildProcessWithoutNullStreams | undefined> {
+  return pipe(
+    await spawnWithFallbackResult(cmd, argsVariants, cwd),
+    E.getOrElseW((): ChildProcessWithoutNullStreams | undefined => undefined),
+  );
 }
 
 function findRootKotlin(file: string, cwd: string): string | undefined {
@@ -335,15 +515,11 @@ function findRootKotlin(file: string, cwd: string): string | undefined {
 }
 
 function dirContainsNestedProjectFile(dir: string, dirSuffix: string, markerFile: string): boolean {
-  try {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const e of entries) {
-      if (!e.isDirectory()) continue;
-      if (!e.name.endsWith(dirSuffix)) continue;
-      if (fs.existsSync(path.join(dir, e.name, markerFile))) return true;
-    }
-  } catch {
-    // ignore
+  const entries = pipe(readDirentsResult(dir), E.getOrElseW((): fs.Dirent[] => []));
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (!entry.name.endsWith(dirSuffix)) continue;
+    if (pathExists(path.join(dir, entry.name, markerFile))) return true;
   }
   return false;
 }
@@ -353,7 +529,7 @@ function findRootSwift(file: string, cwd: string): string | undefined {
   const stop = path.resolve(cwd);
 
   while (current.length >= stop.length) {
-    if (fs.existsSync(path.join(current, "Package.swift"))) return current;
+    if (pathExists(path.join(current, "Package.swift"))) return current;
 
     // Xcode projects/workspaces store their marker files *inside* a directory
     if (dirContainsNestedProjectFile(current, ".xcodeproj", "project.pbxproj")) return current;
@@ -720,100 +896,131 @@ export class LSPManager {
 
   private key(id: string, root: string) { return `${id}:${root}`; }
 
+  private initClientResult(config: LSPServerConfig, root: string): TE.TaskEither<InitClientError, LSPClient> {
+    const k = this.key(config.id, root);
+
+    return pipe(
+      TE.tryCatch(
+        () => config.spawn(root),
+        (cause): InitClientError => ({
+          _tag: "InitClientError",
+          serverId: config.id,
+          root,
+          phase: "spawn",
+          cause,
+        }),
+      ),
+      TE.chain((handle) => handle
+        ? TE.right(handle)
+        : TE.left<InitClientError, Awaited<ReturnType<LSPServerConfig["spawn"]>> extends Promise<infer T> ? Exclude<T, undefined> : never>({
+            _tag: "InitClientError",
+            serverId: config.id,
+            root,
+            phase: "spawn",
+          })),
+      TE.chain((handle) => TE.tryCatch(async () => {
+        const reader = new StreamMessageReader(handle.process.stdout!);
+        const writer = new StreamMessageWriter(handle.process.stdin!);
+        const conn = createMessageConnection(reader, writer);
+
+        handle.process.stdin?.on("error", () => {});
+        handle.process.stdout?.on("error", () => {});
+
+        const stderr: string[] = [];
+        const MAX_STDERR_LINES = 200;
+        handle.process.stderr?.on("data", (chunk: Buffer) => {
+          try {
+            const text = chunk.toString("utf-8");
+            for (const line of text.split(/\r?\n/)) {
+              if (!line.trim()) continue;
+              stderr.push(line);
+              if (stderr.length > MAX_STDERR_LINES) stderr.splice(0, stderr.length - MAX_STDERR_LINES);
+            }
+          } catch {
+            // ignore
+          }
+        });
+        handle.process.stderr?.on("error", () => {});
+
+        const client: LSPClient = {
+          connection: conn,
+          process: handle.process,
+          diagnostics: new Map(),
+          openFiles: new Map(),
+          listeners: new Map(),
+          stderr,
+          root,
+          closed: false,
+        };
+
+        conn.onNotification("textDocument/publishDiagnostics", (params: { uri: string; diagnostics: Diagnostic[] }) => {
+          const fpRaw = decodeURIComponent(new URL(params.uri).pathname);
+          const fp = normalizeFsPath(fpRaw);
+
+          client.diagnostics.set(fp, params.diagnostics);
+          const listeners1 = client.listeners.get(fp);
+          const listeners2 = fp !== fpRaw ? client.listeners.get(fpRaw) : undefined;
+
+          listeners1?.slice().forEach(fn => { try { fn(); } catch { /* listener error */ } });
+          listeners2?.slice().forEach(fn => { try { fn(); } catch { /* listener error */ } });
+        });
+
+        conn.onError(() => {});
+        conn.onClose(() => { client.closed = true; this.clients.delete(k); });
+
+        conn.onRequest("workspace/configuration", () => [handle.initOptions ?? {}]);
+        conn.onRequest("window/workDoneProgress/create", () => null);
+        conn.onRequest("client/registerCapability", () => {});
+        conn.onRequest("client/unregisterCapability", () => {});
+        conn.onRequest("workspace/workspaceFolders", () => [{ name: "workspace", uri: pathToFileURL(root).href }]);
+
+        handle.process.on("exit", () => { client.closed = true; this.clients.delete(k); });
+        handle.process.on("error", () => { client.closed = true; this.clients.delete(k); this.broken.add(k); });
+
+        conn.listen();
+
+        const initResult = await timeout(conn.sendRequest(InitializeRequest.method, {
+          rootUri: pathToFileURL(root).href,
+          rootPath: root,
+          processId: process.pid,
+          workspaceFolders: [{ name: "workspace", uri: pathToFileURL(root).href }],
+          initializationOptions: handle.initOptions ?? {},
+          capabilities: {
+            window: { workDoneProgress: true },
+            workspace: { configuration: true },
+            textDocument: {
+              synchronization: { didSave: true, didOpen: true, didChange: true, didClose: true },
+              publishDiagnostics: { versionSupport: true },
+              diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
+            },
+          },
+        }), INIT_TIMEOUT_MS, `${config.id} init`);
+
+        client.capabilities = (initResult as any)?.capabilities;
+
+        conn.sendNotification(InitializedNotification.type, {});
+        if (handle.initOptions) {
+          conn.sendNotification("workspace/didChangeConfiguration", { settings: handle.initOptions });
+        }
+        return client;
+      }, (cause): InitClientError => ({
+        _tag: "InitClientError",
+        serverId: config.id,
+        root,
+        phase: "initialize",
+        cause,
+      }))),
+    );
+  }
+
   private async initClient(config: LSPServerConfig, root: string): Promise<LSPClient | undefined> {
     const k = this.key(config.id, root);
-    try {
-      const handle = await config.spawn(root);
-      if (!handle) { this.broken.add(k); return undefined; }
-
-      const reader = new StreamMessageReader(handle.process.stdout!);
-      const writer = new StreamMessageWriter(handle.process.stdin!);
-      const conn = createMessageConnection(reader, writer);
-      
-      // Prevent crashes from stream errors
-      handle.process.stdin?.on("error", () => {});
-      handle.process.stdout?.on("error", () => {});
-
-      const stderr: string[] = [];
-      const MAX_STDERR_LINES = 200;
-      handle.process.stderr?.on("data", (chunk: Buffer) => {
-        try {
-          const text = chunk.toString("utf-8");
-          for (const line of text.split(/\r?\n/)) {
-            if (!line.trim()) continue;
-            stderr.push(line);
-            if (stderr.length > MAX_STDERR_LINES) stderr.splice(0, stderr.length - MAX_STDERR_LINES);
-          }
-        } catch {
-          // ignore
-        }
-      });
-      handle.process.stderr?.on("error", () => {});
-
-      const client: LSPClient = {
-        connection: conn,
-        process: handle.process,
-        diagnostics: new Map(),
-        openFiles: new Map(),
-        listeners: new Map(),
-        stderr,
-        root,
-        closed: false,
-      };
-
-      conn.onNotification("textDocument/publishDiagnostics", (params: { uri: string; diagnostics: Diagnostic[] }) => {
-        const fpRaw = decodeURIComponent(new URL(params.uri).pathname);
-        const fp = normalizeFsPath(fpRaw);
-
-        client.diagnostics.set(fp, params.diagnostics);
-        // Notify both raw and normalized paths (macOS often reports /private/var vs /var)
-        const listeners1 = client.listeners.get(fp);
-        const listeners2 = fp !== fpRaw ? client.listeners.get(fpRaw) : undefined;
-
-        listeners1?.slice().forEach(fn => { try { fn(); } catch { /* listener error */ } });
-        listeners2?.slice().forEach(fn => { try { fn(); } catch { /* listener error */ } });
-      });
-
-      // Handle errors to prevent crashes
-      conn.onError(() => {});
-      conn.onClose(() => { client.closed = true; this.clients.delete(k); });
-
-      conn.onRequest("workspace/configuration", () => [handle.initOptions ?? {}]);
-      conn.onRequest("window/workDoneProgress/create", () => null);
-      conn.onRequest("client/registerCapability", () => {});
-      conn.onRequest("client/unregisterCapability", () => {});
-      conn.onRequest("workspace/workspaceFolders", () => [{ name: "workspace", uri: pathToFileURL(root).href }]);
-
-      handle.process.on("exit", () => { client.closed = true; this.clients.delete(k); });
-      handle.process.on("error", () => { client.closed = true; this.clients.delete(k); this.broken.add(k); });
-
-      conn.listen();
-
-      const initResult = await timeout(conn.sendRequest(InitializeRequest.method, {
-        rootUri: pathToFileURL(root).href,
-        rootPath: root,
-        processId: process.pid,
-        workspaceFolders: [{ name: "workspace", uri: pathToFileURL(root).href }],
-        initializationOptions: handle.initOptions ?? {},
-        capabilities: {
-          window: { workDoneProgress: true },
-          workspace: { configuration: true },
-          textDocument: {
-            synchronization: { didSave: true, didOpen: true, didChange: true, didClose: true },
-            publishDiagnostics: { versionSupport: true },
-            diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
-          },
-        },
-      }), INIT_TIMEOUT_MS, `${config.id} init`);
-
-      client.capabilities = (initResult as any)?.capabilities;
-
-      conn.sendNotification(InitializedNotification.type, {});
-      if (handle.initOptions) {
-        conn.sendNotification("workspace/didChangeConfiguration", { settings: handle.initOptions });
-      }
-      return client;
-    } catch { this.broken.add(k); return undefined; }
+    const result = await this.initClientResult(config, root)();
+    if (E.isLeft(result)) {
+      this.broken.add(k);
+      return undefined;
+    }
+    return result.right;
   }
 
   async getClientsForFile(filePath: string): Promise<LSPClient[]> {
@@ -847,7 +1054,12 @@ export class LSPManager {
     return normalizeFsPath(abs);
   }
   private langId(fp: string) { return LANGUAGE_IDS[path.extname(fp)] || "plaintext"; }
-  private readFile(fp: string): string | null { try { return fs.readFileSync(fp, "utf-8"); } catch { return null; } }
+  private readFile(fp: string): string | null {
+    return pipe(
+      readUtf8FileResult(fp),
+      E.getOrElseW((): string | null => null),
+    );
+  }
 
   private explainNoLsp(absPath: string): string {
     const ext = path.extname(absPath);
@@ -939,13 +1151,57 @@ export class LSPManager {
     }
   }
 
-  private async loadFile(filePath: string) {
+  private async loadFileOption(filePath: string): Promise<O.Option<LoadedFileContext>> {
     const absPath = this.resolve(filePath);
     const clients = await this.getClientsForFile(absPath);
-    if (!clients.length) return null;
+    if (!clients.length) return O.none;
     const content = this.readFile(absPath);
-    if (content === null) return null;
-    return { clients, absPath, uri: pathToFileURL(absPath).href, langId: this.langId(absPath), content };
+    if (content === null) return O.none;
+    return O.some({ clients, absPath, uri: pathToFileURL(absPath).href, langId: this.langId(absPath), content });
+  }
+
+  private requestResult<A>(client: LSPClient, method: string, task: () => Promise<A>): TE.TaskEither<RequestExecutionError, A> {
+    if (client.closed) {
+      return TE.left({
+        _tag: "RequestExecutionError",
+        method,
+        root: client.root,
+        cause: "client_closed",
+      });
+    }
+
+    return TE.tryCatch(task, (cause): RequestExecutionError => ({
+      _tag: "RequestExecutionError",
+      method,
+      root: client.root,
+      cause,
+    }));
+  }
+
+  private async collectRequestResults<A>(
+    clients: LSPClient[],
+    method: string,
+    request: (client: LSPClient) => Promise<A[]>,
+  ): Promise<A[]> {
+    const results = await Promise.all(clients.map(async (client) => pipe(
+      await this.requestResult(client, method, () => request(client))(),
+      E.getOrElseW((): A[] => []),
+    )));
+
+    return results.flat();
+  }
+
+  private async firstOptionRequest<A>(
+    clients: LSPClient[],
+    method: string,
+    request: (client: LSPClient) => Promise<A | null | undefined>,
+  ): Promise<O.Option<A>> {
+    for (const client of clients) {
+      const result = await this.requestResult(client, method, () => request(client))();
+      if (E.isRight(result) && result.right != null) return O.some(result.right);
+    }
+
+    return O.none;
   }
 
   private waitForDiagnostics(client: LSPClient, absPath: string, timeoutMs: number, isNew: boolean): Promise<boolean> {
@@ -1046,21 +1302,21 @@ export class LSPManager {
     }
   }
 
-  async touchFileAndWait(filePath: string, timeoutMs: number): Promise<{ diagnostics: Diagnostic[]; receivedResponse: boolean; unsupported?: boolean; error?: string }> {
+  async touchFileAndWaitResult(filePath: string, timeoutMs: number): Promise<TouchFileDiagnosticsResult> {
     const absPath = this.resolve(filePath);
 
     if (!fs.existsSync(absPath)) {
-      return { diagnostics: [], receivedResponse: false, unsupported: true, error: "File not found" };
+      return { status: "error", diagnostics: [], error: "File not found" };
     }
 
     const clients = await this.getClientsForFile(absPath);
     if (!clients.length) {
-      return { diagnostics: [], receivedResponse: false, unsupported: true, error: this.explainNoLsp(absPath) };
+      return { status: "unsupported", diagnostics: [], error: this.explainNoLsp(absPath) };
     }
 
     const content = this.readFile(absPath);
     if (content === null) {
-      return { diagnostics: [], receivedResponse: false, unsupported: true, error: "Could not read file" };
+      return { status: "error", diagnostics: [], error: "Could not read file" };
     }
 
     const uri = pathToFileURL(absPath).href;
@@ -1079,7 +1335,6 @@ export class LSPManager {
     }
     if (!responded && clients.some(c => c.diagnostics.has(absPath))) responded = true;
 
-    // If we didn't get pushed diagnostics (common for some servers), try pull diagnostics.
     if (!responded || diags.length === 0) {
       const pulled = await Promise.all(clients.map(c => this.pullDiagnostics(c, absPath, uri)));
       for (let i = 0; i < clients.length; i++) {
@@ -1092,32 +1347,44 @@ export class LSPManager {
       }
     }
 
-    return { diagnostics: diags, receivedResponse: responded };
+    if (!responded) {
+      return { status: "timeout", diagnostics: diags, error: "LSP did not respond" };
+    }
+
+    return { status: "success", diagnostics: diags };
   }
 
-  async getDiagnosticsForFiles(files: string[], timeoutMs: number): Promise<FileDiagnosticsResult> {
+  async touchFileAndWait(filePath: string, timeoutMs: number): Promise<LegacyTouchFileResult> {
+    return toLegacyTouchFileResult(await this.touchFileAndWaitResult(filePath, timeoutMs));
+  }
+
+  async getDiagnosticsForFilesResult(files: string[], timeoutMs: number): Promise<FileDiagnosticsResultV2> {
     const unique = [...new Set(files.map(f => this.resolve(f)))];
-    const results: FileDiagnosticItem[] = [];
+    const results: FileDiagnosticsItemResult[] = [];
     const toClose: Map<LSPClient, string[]> = new Map();
 
     for (const absPath of unique) {
       if (!fs.existsSync(absPath)) {
-        results.push({ file: absPath, diagnostics: [], status: 'error', error: 'File not found' });
+        results.push({ file: absPath, diagnostics: [], status: "error", error: "File not found" });
         continue;
       }
 
       let clients: LSPClient[];
-      try { clients = await this.getClientsForFile(absPath); }
-      catch (e) { results.push({ file: absPath, diagnostics: [], status: 'error', error: String(e) }); continue; }
+      try {
+        clients = await this.getClientsForFile(absPath);
+      } catch (e) {
+        results.push({ file: absPath, diagnostics: [], status: "error", error: String(e) });
+        continue;
+      }
 
       if (!clients.length) {
-        results.push({ file: absPath, diagnostics: [], status: 'unsupported', error: this.explainNoLsp(absPath) });
+        results.push({ file: absPath, diagnostics: [], status: "unsupported", error: this.explainNoLsp(absPath) });
         continue;
       }
 
       const content = this.readFile(absPath);
-      if (!content) {
-        results.push({ file: absPath, diagnostics: [], status: 'error', error: 'Could not read file' });
+      if (content === null) {
+        results.push({ file: absPath, diagnostics: [], status: "error", error: "Could not read file" });
         continue;
       }
 
@@ -1137,7 +1404,10 @@ export class LSPManager {
       const waitResults = await Promise.all(waits);
 
       const diags: Diagnostic[] = [];
-      for (const c of clients) { const d = c.diagnostics.get(absPath); if (d) diags.push(...d); }
+      for (const c of clients) {
+        const d = c.diagnostics.get(absPath);
+        if (d) diags.push(...d);
+      }
 
       let responded = waitResults.some(r => r) || diags.length > 0;
 
@@ -1154,112 +1424,126 @@ export class LSPManager {
       }
 
       if (!responded && !diags.length) {
-        results.push({ file: absPath, diagnostics: [], status: 'timeout', error: 'LSP did not respond' });
+        results.push({ file: absPath, diagnostics: [], status: "timeout", error: "LSP did not respond" });
       } else {
-        results.push({ file: absPath, diagnostics: diags, status: 'ok' });
+        results.push({ file: absPath, diagnostics: diags, status: "success" });
       }
     }
 
-    // Cleanup opened files
-    for (const [c, fps] of toClose) { for (const fp of fps) this.closeFile(c, fp); }
-    for (const c of this.clients.values()) { while (c.openFiles.size > MAX_OPEN_FILES) this.evictLRU(c); }
+    for (const [c, fps] of toClose) {
+      for (const fp of fps) this.closeFile(c, fp);
+    }
+    for (const c of this.clients.values()) {
+      while (c.openFiles.size > MAX_OPEN_FILES) this.evictLRU(c);
+    }
 
     return { items: results };
   }
 
+  async getDiagnosticsForFiles(files: string[], timeoutMs: number): Promise<FileDiagnosticsResult> {
+    return toLegacyFileDiagnosticsResult(await this.getDiagnosticsForFilesResult(files, timeoutMs));
+  }
+
   async getDefinition(fp: string, line: number, col: number): Promise<Location[]> {
-    const l = await this.loadFile(fp);
-    if (!l) return [];
+    const loaded = await this.loadFileOption(fp);
+    if (O.isNone(loaded)) return [];
+    const l = loaded.value;
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
     const pos = this.toPos(line, col);
-    const results = await Promise.all(l.clients.map(async c => {
-      if (c.closed) return [];
-      try { return this.normalizeLocs(await c.connection.sendRequest(DefinitionRequest.type, { textDocument: { uri: l.uri }, position: pos })); }
-      catch { return []; }
-    }));
-    return results.flat();
+    return this.collectRequestResults(l.clients, DefinitionRequest.method, async (client) =>
+      this.normalizeLocs(await client.connection.sendRequest(DefinitionRequest.type, { textDocument: { uri: l.uri }, position: pos })),
+    );
   }
 
   async getReferences(fp: string, line: number, col: number): Promise<Location[]> {
-    const l = await this.loadFile(fp);
-    if (!l) return [];
+    const loaded = await this.loadFileOption(fp);
+    if (O.isNone(loaded)) return [];
+    const l = loaded.value;
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
     const pos = this.toPos(line, col);
-    const results = await Promise.all(l.clients.map(async c => {
-      if (c.closed) return [];
-      try { return this.normalizeLocs(await c.connection.sendRequest(ReferencesRequest.type, { textDocument: { uri: l.uri }, position: pos, context: { includeDeclaration: true } })); }
-      catch { return []; }
-    }));
-    return results.flat();
+    return this.collectRequestResults(l.clients, ReferencesRequest.method, async (client) =>
+      this.normalizeLocs(await client.connection.sendRequest(ReferencesRequest.type, { textDocument: { uri: l.uri }, position: pos, context: { includeDeclaration: true } })),
+    );
+  }
+
+  async getHoverOption(fp: string, line: number, col: number): Promise<O.Option<Hover>> {
+    const loaded = await this.loadFileOption(fp);
+    if (O.isNone(loaded)) return O.none;
+    const l = loaded.value;
+    await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
+    const pos = this.toPos(line, col);
+    return this.firstOptionRequest(l.clients, HoverRequest.method, (client) =>
+      client.connection.sendRequest(HoverRequest.type, { textDocument: { uri: l.uri }, position: pos }),
+    );
   }
 
   async getHover(fp: string, line: number, col: number): Promise<Hover | null> {
-    const l = await this.loadFile(fp);
-    if (!l) return null;
+    return pipe(
+      await this.getHoverOption(fp, line, col),
+      O.getOrElse<Hover | null>(() => null),
+    );
+  }
+
+  async getSignatureHelpOption(fp: string, line: number, col: number): Promise<O.Option<SignatureHelp>> {
+    const loaded = await this.loadFileOption(fp);
+    if (O.isNone(loaded)) return O.none;
+    const l = loaded.value;
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
     const pos = this.toPos(line, col);
-    for (const c of l.clients) {
-      if (c.closed) continue;
-      try { const r = await c.connection.sendRequest(HoverRequest.type, { textDocument: { uri: l.uri }, position: pos }); if (r) return r; }
-      catch {}
-    }
-    return null;
+    return this.firstOptionRequest(l.clients, SignatureHelpRequest.method, (client) =>
+      client.connection.sendRequest(SignatureHelpRequest.type, { textDocument: { uri: l.uri }, position: pos }),
+    );
   }
 
   async getSignatureHelp(fp: string, line: number, col: number): Promise<SignatureHelp | null> {
-    const l = await this.loadFile(fp);
-    if (!l) return null;
-    await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
-    const pos = this.toPos(line, col);
-    for (const c of l.clients) {
-      if (c.closed) continue;
-      try { const r = await c.connection.sendRequest(SignatureHelpRequest.type, { textDocument: { uri: l.uri }, position: pos }); if (r) return r; }
-      catch {}
-    }
-    return null;
+    return pipe(
+      await this.getSignatureHelpOption(fp, line, col),
+      O.getOrElse<SignatureHelp | null>(() => null),
+    );
   }
 
   async getDocumentSymbols(fp: string): Promise<DocumentSymbol[]> {
-    const l = await this.loadFile(fp);
-    if (!l) return [];
+    const loaded = await this.loadFileOption(fp);
+    if (O.isNone(loaded)) return [];
+    const l = loaded.value;
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
-    const results = await Promise.all(l.clients.map(async c => {
-      if (c.closed) return [];
-      try { return this.normalizeSymbols(await c.connection.sendRequest(DocumentSymbolRequest.type, { textDocument: { uri: l.uri } })); }
-      catch { return []; }
-    }));
-    return results.flat();
+    return this.collectRequestResults(l.clients, DocumentSymbolRequest.method, async (client) =>
+      this.normalizeSymbols(await client.connection.sendRequest(DocumentSymbolRequest.type, { textDocument: { uri: l.uri } })),
+    );
+  }
+
+  async renameOption(fp: string, line: number, col: number, newName: string): Promise<O.Option<WorkspaceEdit>> {
+    const loaded = await this.loadFileOption(fp);
+    if (O.isNone(loaded)) return O.none;
+    const l = loaded.value;
+    await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
+    const pos = this.toPos(line, col);
+    return this.firstOptionRequest(l.clients, RenameRequest.method, (client) =>
+      client.connection.sendRequest(RenameRequest.type, {
+        textDocument: { uri: l.uri },
+        position: pos,
+        newName,
+      }),
+    );
   }
 
   async rename(fp: string, line: number, col: number, newName: string): Promise<WorkspaceEdit | null> {
-    const l = await this.loadFile(fp);
-    if (!l) return null;
-    await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
-    const pos = this.toPos(line, col);
-    for (const c of l.clients) {
-      if (c.closed) continue;
-      try {
-        const r = await c.connection.sendRequest(RenameRequest.type, {
-          textDocument: { uri: l.uri },
-          position: pos,
-          newName,
-        });
-        if (r) return r;
-      } catch {}
-    }
-    return null;
+    return pipe(
+      await this.renameOption(fp, line, col, newName),
+      O.getOrElse<WorkspaceEdit | null>(() => null),
+    );
   }
 
   async getCodeActions(fp: string, startLine: number, startCol: number, endLine?: number, endCol?: number): Promise<(CodeAction | Command)[]> {
-    const l = await this.loadFile(fp);
-    if (!l) return [];
+    const loaded = await this.loadFileOption(fp);
+    if (O.isNone(loaded)) return [];
+    const l = loaded.value;
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
-    
+
     const start = this.toPos(startLine, startCol);
     const end = this.toPos(endLine ?? startLine, endCol ?? startCol);
     const range = { start, end };
-    
-    // Get diagnostics for this range to include in context
+
     const diagnostics: Diagnostic[] = [];
     for (const c of l.clients) {
       const fileDiags = c.diagnostics.get(l.absPath) || [];
@@ -1267,19 +1551,15 @@ export class LSPManager {
         if (this.rangesOverlap(d.range, range)) diagnostics.push(d);
       }
     }
-    
-    const results = await Promise.all(l.clients.map(async c => {
-      if (c.closed) return [];
-      try {
-        const r = await c.connection.sendRequest(CodeActionRequest.type, {
-          textDocument: { uri: l.uri },
-          range,
-          context: { diagnostics, only: [CodeActionKind.QuickFix, CodeActionKind.Refactor, CodeActionKind.Source] },
-        });
-        return r || [];
-      } catch { return []; }
-    }));
-    return results.flat();
+
+    return this.collectRequestResults(l.clients, CodeActionRequest.method, async (client) => {
+      const result = await client.connection.sendRequest(CodeActionRequest.type, {
+        textDocument: { uri: l.uri },
+        range,
+        context: { diagnostics, only: [CodeActionKind.QuickFix, CodeActionKind.Refactor, CodeActionKind.Source] },
+      });
+      return result || [];
+    });
   }
 
   private rangesOverlap(a: { start: { line: number; character: number }; end: { line: number; character: number } }, 
@@ -1328,36 +1608,88 @@ export function filterDiagnosticsBySeverity(diags: Diagnostic[], filter: Severit
 }
 
 // URI utilities
+export interface UriToPathError {
+  _tag: "UriToPathError";
+  uri: string;
+  cause: unknown;
+}
+
+export interface SymbolPosition {
+  line: number;
+  character: number;
+}
+
+export function decodeFileUri(uri: string): E.Either<UriToPathError, string> {
+  return E.tryCatch(
+    () => fileURLToPath(uri),
+    (cause): UriToPathError => ({
+      _tag: "UriToPathError",
+      uri,
+      cause,
+    }),
+  );
+}
+
 export function uriToPath(uri: string): string {
-  if (uri.startsWith("file://")) try { return fileURLToPath(uri); } catch {}
-  return uri;
+  if (!uri.startsWith("file://")) return uri;
+  return pipe(
+    decodeFileUri(uri),
+    E.getOrElse(() => uri),
+  );
+}
+
+function symbolStart(sym: DocumentSymbol): O.Option<SymbolPosition> {
+  return O.fromNullable(sym.selectionRange?.start ?? sym.range?.start);
+}
+
+function findSymbolMatch(
+  symbols: ReadonlyArray<DocumentSymbol>,
+  query: string,
+  predicate: (name: string, normalizedQuery: string) => boolean,
+): O.Option<SymbolPosition> {
+  for (const sym of symbols) {
+    const name = String(sym.name ?? "").toLowerCase();
+    if (predicate(name, query)) {
+      const current = symbolStart(sym);
+      if (O.isSome(current)) return current;
+    }
+
+    if (sym.children?.length) {
+      const child = findSymbolMatch(sym.children, query, predicate);
+      if (O.isSome(child)) return child;
+    }
+  }
+
+  return O.none;
 }
 
 // Symbol search
-export function findSymbolPosition(symbols: DocumentSymbol[], query: string): { line: number; character: number } | null {
-  const q = query.toLowerCase();
-  let exact: { line: number; character: number } | null = null;
-  let partial: { line: number; character: number } | null = null;
+export function findSymbolPositionOption(symbols: DocumentSymbol[], query: string): O.Option<SymbolPosition> {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return O.none;
 
-  const visit = (items: DocumentSymbol[]) => {
-    for (const sym of items) {
-      const name = String(sym?.name ?? "").toLowerCase();
-      const pos = sym?.selectionRange?.start ?? sym?.range?.start;
-      if (pos && typeof pos.line === "number" && typeof pos.character === "number") {
-        if (!exact && name === q) exact = pos;
-        if (!partial && name.includes(q)) partial = pos;
-      }
-      if (sym?.children?.length) visit(sym.children);
-    }
-  };
-  visit(symbols);
-  return exact ?? partial;
+  return pipe(
+    findSymbolMatch(symbols, normalized, (name, q) => name === q),
+    O.alt(() => findSymbolMatch(symbols, normalized, (name, q) => name.includes(q))),
+  );
+}
+
+export function findSymbolPosition(symbols: DocumentSymbol[], query: string): SymbolPosition | null {
+  return pipe(
+    findSymbolPositionOption(symbols, query),
+    O.getOrElse<SymbolPosition | null>(() => null),
+  );
 }
 
 export async function resolvePosition(manager: LSPManager, file: string, query: string): Promise<{ line: number; column: number } | null> {
   const symbols = await manager.getDocumentSymbols(file);
-  const pos = findSymbolPosition(symbols, query);
-  return pos ? { line: pos.line + 1, column: pos.character + 1 } : null;
+  return pipe(
+    findSymbolPositionOption(symbols, query),
+    O.match(
+      () => null,
+      (pos) => ({ line: pos.line + 1, column: pos.character + 1 }),
+    ),
+  );
 }
 
 /**
@@ -1369,16 +1701,25 @@ export async function resolvePosition(manager: LSPManager, file: string, query: 
  * all expect.  Falls back to `range` for servers that omit `selectionRange`.
  */
 export function collectSymbols(symbols: DocumentSymbol[], depth = 0, lines: string[] = [], query?: string): string[] {
+  const normalizedQuery = query?.toLowerCase();
+
   for (const sym of symbols) {
-    const name = (sym as any)?.name ?? "<unknown>";
-    if (query && !name.toLowerCase().includes(query.toLowerCase())) {
-      if ((sym as any).children?.length) collectSymbols((sym as any).children, depth + 1, lines, query);
+    const name = sym.name ?? "<unknown>";
+    if (normalizedQuery && !name.toLowerCase().includes(normalizedQuery)) {
+      if (sym.children?.length) collectSymbols(sym.children, depth + 1, lines, query);
       continue;
     }
-    const startPos = sym?.selectionRange?.start ?? sym?.range?.start;
-    const loc = startPos ? `${startPos.line + 1}:${startPos.character + 1}` : "";
+
+    const loc = pipe(
+      symbolStart(sym),
+      O.match(
+        () => "",
+        (startPos) => `${startPos.line + 1}:${startPos.character + 1}`,
+      ),
+    );
+
     lines.push(`${"  ".repeat(depth)}${name}${loc ? ` (${loc})` : ""}`);
-    if ((sym as any).children?.length) collectSymbols((sym as any).children, depth + 1, lines, query);
+    if (sym.children?.length) collectSymbols(sym.children, depth + 1, lines, query);
   }
   return lines;
 }

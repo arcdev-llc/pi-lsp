@@ -14,7 +14,7 @@ import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { pathToFileURL } from "url";
-import { LSP_SERVERS, LANGUAGE_IDS } from "../lsp-core.js";
+import { LSP_SERVERS, LANGUAGE_IDS } from "../src/lsp-core.ts";
 
 // ============================================================================
 // Test utilities

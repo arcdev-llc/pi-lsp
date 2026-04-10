@@ -24,11 +24,29 @@
  */
 
 import * as path from "node:path";
+import * as E from "fp-ts/lib/Either.js";
+import * as O from "fp-ts/lib/Option.js";
+import * as TE from "fp-ts/lib/TaskEither.js";
+import { pipe } from "fp-ts/lib/function.js";
 import { Type, type Static } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import { getOrCreateManager, formatDiagnostic, filterDiagnosticsBySeverity, uriToPath, resolvePosition, collectSymbols, inspectWorkspaceLsp, truncateHead, type SeverityFilter } from "./lsp-core.js";
+import { getOrCreateManager, formatDiagnostic, filterDiagnosticsBySeverity, resolvePosition, collectSymbols, inspectWorkspaceLsp, truncateHead, type SeverityFilter } from "./lsp-core.js";
+import {
+  formatCodeActions,
+  formatHover,
+  formatLocation,
+  formatSignature,
+  formatToolExecutionError,
+  formatWorkspaceEdit,
+  normalizeExecuteArgsResult,
+  resolveValidatedCommand,
+  toToolExecutionError,
+  validateLspCommand,
+  type ExecutableLspCommand,
+  type ToolExecutionError,
+} from "./lsp-tool-helpers.js";
 
 const PREVIEW_LINES = 10;
 
@@ -102,112 +120,194 @@ function cancelledToolResult() {
   };
 }
 
-type ExecuteArgs = {
-  signal: AbortSignal | undefined;
-  onUpdate: ((update: { content: Array<{ type: "text"; text: string }>; details?: Record<string, unknown> }) => void) | undefined;
-  ctx: { cwd: string };
+type ToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+  details?: unknown;
 };
 
-function isAbortSignalLike(value: unknown): value is AbortSignal {
-  return !!value
-    && typeof value === "object"
-    && "aborted" in value
-    && typeof (value as any).aborted === "boolean"
-    && typeof (value as any).addEventListener === "function";
+function commandHeader(command: ExecutableLspCommand): { qLine: string; sevLine: string; posLine: string } {
+  const qLine = "query" in command && command.query ? `query: ${command.query}\n` : "";
+  const sevLine = command.severity !== "all" ? `severity: ${command.severity}\n` : "";
+  const posLine = "fromQuery" in command && command.fromQuery ? `resolvedPosition: ${command.line}:${command.column}\n` : "";
+  return { qLine, sevLine, posLine };
 }
 
-function isContextLike(value: unknown): value is { cwd: string } {
-  return !!value && typeof value === "object" && typeof (value as any).cwd === "string";
-}
+function executeValidatedCommand(
+  command: ExecutableLspCommand,
+  deps: {
+    cwd: string;
+    signal?: AbortSignal;
+    manager: ReturnType<typeof getOrCreateManager>;
+  },
+): TE.TaskEither<ToolExecutionError, ToolResult> {
+  const { cwd, signal, manager } = deps;
+  const { qLine, sevLine, posLine } = commandHeader(command);
+  const runTask = <A>(task: () => Promise<A>, message: string) => TE.tryCatch(task, (cause) => toToolExecutionError(cause, message));
 
-function normalizeExecuteArgs(onUpdateArg: unknown, ctxArg: unknown, signalArg: unknown): ExecuteArgs {
-  // Runtime >= 0.51: (signal, onUpdate, ctx)
-  if (isContextLike(signalArg)) {
-    return {
-      signal: isAbortSignalLike(onUpdateArg) ? onUpdateArg : undefined,
-      onUpdate: typeof ctxArg === "function" ? ctxArg as ExecuteArgs["onUpdate"] : undefined,
-      ctx: signalArg,
-    };
-  }
-
-  // Runtime <= 0.50: (onUpdate, ctx, signal)
-  if (isContextLike(ctxArg)) {
-    return {
-      signal: isAbortSignalLike(signalArg) ? signalArg : undefined,
-      onUpdate: typeof onUpdateArg === "function" ? onUpdateArg as ExecuteArgs["onUpdate"] : undefined,
-      ctx: ctxArg,
-    };
-  }
-
-  throw new Error("Invalid tool execution context");
-}
-
-function formatLocation(loc: { uri: string; range?: { start?: { line: number; character: number } } }, cwd?: string): string {
-  const abs = uriToPath(loc.uri);
-  const display = cwd && path.isAbsolute(abs) ? path.relative(cwd, abs) : abs;
-  const { line, character: col } = loc.range?.start ?? {};
-  return typeof line === "number" && typeof col === "number" ? `${display}:${line + 1}:${col + 1}` : display;
-}
-
-function formatHover(contents: unknown): string {
-  if (typeof contents === "string") return contents;
-  if (Array.isArray(contents)) return contents.map(c => typeof c === "string" ? c : (c as any)?.value ?? "").filter(Boolean).join("\n\n");
-  if (contents && typeof contents === "object" && "value" in contents) return String((contents as any).value);
-  return "";
-}
-
-function formatSignature(help: any): string {
-  if (!help?.signatures?.length) return "No signature help available.";
-  const sig = help.signatures[help.activeSignature ?? 0] ?? help.signatures[0];
-  let text = sig.label ?? "Signature";
-  if (sig.documentation) text += `\n${typeof sig.documentation === "string" ? sig.documentation : sig.documentation?.value ?? ""}`;
-  if (sig.parameters?.length) {
-    const params = sig.parameters.map((p: any) => typeof p.label === "string" ? p.label : Array.isArray(p.label) ? p.label.join("-") : "").filter(Boolean);
-    if (params.length) text += `\nParameters: ${params.join(", ")}`;
-  }
-  return text;
-}
-
-
-function formatWorkspaceEdit(edit: any, cwd?: string): string {
-  const lines: string[] = [];
-  
-  if (edit.documentChanges?.length) {
-    for (const change of edit.documentChanges) {
-      if (change.textDocument?.uri) {
-        const fp = uriToPath(change.textDocument.uri);
-        const display = cwd && path.isAbsolute(fp) ? path.relative(cwd, fp) : fp;
-        lines.push(`${display}:`);
-        for (const e of change.edits || []) {
-          const loc = `${e.range.start.line + 1}:${e.range.start.character + 1}`;
-          lines.push(`  [${loc}] → "${e.newText}"`);
-        }
+  switch (command.action) {
+    case "status": {
+      const support = inspectWorkspaceLsp(cwd);
+      if (!support.length) {
+        return TE.right({
+          content: [{
+            type: "text",
+            text: "action: status\nNo supported LSP workspace detected from the current cwd. If the project lives in a subdirectory, cd there first or use bash/read to inspect the repo layout.",
+          }],
+          details: { support: [] },
+        });
       }
-    }
-  }
-  
-  if (edit.changes) {
-    for (const [uri, edits] of Object.entries(edit.changes)) {
-      const fp = uriToPath(uri);
-      const display = cwd && path.isAbsolute(fp) ? path.relative(cwd, fp) : fp;
-      lines.push(`${display}:`);
-      for (const e of edits as any[]) {
-        const loc = `${e.range.start.line + 1}:${e.range.start.character + 1}`;
-        lines.push(`  [${loc}] → "${e.newText}"`);
-      }
-    }
-  }
-  
-  return lines.length ? lines.join("\n") : "No edits.";
-}
 
-function formatCodeActions(actions: any[]): string[] {
-  return actions.map((a, i) => {
-    const title = a.title || a.command?.title || "Untitled action";
-    const kind = a.kind ? ` (${a.kind})` : "";
-    const isPreferred = a.isPreferred ? " ★" : "";
-    return `${i + 1}. ${title}${kind}${isPreferred}`;
-  });
+      const lines = support.map((item) => {
+        const displayRoot = path.relative(cwd, item.root) || ".";
+        const availability = item.binaryAvailable ? `binary: ${item.binary}` : `binary missing: expected ${item.binary}`;
+        return `- ${item.language} (${item.serverId})\n  root: ${displayRoot}\n  ${availability}`;
+      });
+
+      return TE.right({
+        content: [{
+          type: "text",
+          text: `action: status\nDetected ${support.length} LSP workspace(s):\n${lines.join("\n")}`,
+        }],
+        details: { support },
+      });
+    }
+    case "definition":
+      return pipe(
+        runTask(() => abortable(manager.getDefinition(command.file, command.line, command.column), signal), `Failed to get definition for ${command.file}.`),
+        TE.map((results) => {
+          const locs = results.map((loc) => formatLocation(loc, cwd));
+          const payload = locs.length ? locs.join("\n") : command.fromQuery ? `${command.file}:${command.line}:${command.column}` : "No definitions found.";
+          return { content: [{ type: "text", text: `action: definition\n${qLine}${posLine}${payload}` }], details: results };
+        }),
+      );
+    case "references":
+      return pipe(
+        runTask(() => abortable(manager.getReferences(command.file, command.line, command.column), signal), `Failed to get references for ${command.file}.`),
+        TE.map((results) => {
+          const locs = results.map((loc) => formatLocation(loc, cwd));
+          return { content: [{ type: "text", text: `action: references\n${qLine}${posLine}${locs.length ? locs.join("\n") : "No references found."}` }], details: results };
+        }),
+      );
+    case "hover":
+      return pipe(
+        runTask(() => abortable(manager.getHoverOption(command.file, command.line, command.column), signal), `Failed to get hover information for ${command.file}.`),
+        TE.map((result) => {
+          const payload = pipe(
+            result,
+            O.match(
+              () => "No hover information.",
+              (hover) => formatHover(hover.contents) || "No hover information.",
+            ),
+          );
+          return { content: [{ type: "text", text: `action: hover\n${qLine}${posLine}${payload}` }], details: pipe(result, O.getOrElse<unknown>(() => null)) };
+        }),
+      );
+    case "symbols":
+      return pipe(
+        runTask(() => abortable(manager.getDocumentSymbols(command.file), signal), `Failed to get symbols for ${command.file}.`),
+        TE.map((symbols) => {
+          const lines = collectSymbols(symbols, 0, [], command.query);
+          const truncated = truncateHead(lines, SYMBOLS_MAX_LINES, SYMBOLS_MAX_BYTES);
+          let payload: string;
+          if (truncated.truncated) {
+            payload = truncated.content;
+            payload += `\n\n[Truncated: ${truncated.outputLines} of ${truncated.totalLines} symbol lines shown. Use a narrower query to filter results.]`;
+          } else {
+            payload = lines.length ? lines.join("\n") : command.query ? `No symbols matching "${command.query}".` : "No symbols found.";
+          }
+          return { content: [{ type: "text", text: `action: symbols\n${qLine}${payload}` }], details: symbols };
+        }),
+      );
+    case "diagnostics":
+      return pipe(
+        runTask(() => abortable(manager.touchFileAndWaitResult(command.file, diagnosticsWaitMsForFile(command.file)), signal), `Failed to get diagnostics for ${command.file}.`),
+        TE.map((result) => {
+          const filtered = filterDiagnosticsBySeverity(result.diagnostics, command.severity);
+          const payload = (() => {
+            switch (result.status) {
+              case "unsupported":
+                return `Unsupported: ${result.error || "No LSP for this file."}`;
+              case "timeout":
+                return "Timeout: LSP server did not respond. Try again.";
+              case "error":
+                return `Error: ${result.error}`;
+              case "success":
+                return filtered.length ? filtered.map(formatDiagnostic).join("\n") : "No diagnostics.";
+            }
+          })();
+          return { content: [{ type: "text", text: `action: diagnostics\n${sevLine}${payload}` }], details: { ...result, diagnostics: filtered } };
+        }),
+      );
+    case "workspace-diagnostics":
+      return pipe(
+        runTask(() => {
+          const waitMs = Math.max(...command.files.map(diagnosticsWaitMsForFile));
+          return abortable(manager.getDiagnosticsForFilesResult(command.files, waitMs), signal);
+        }, "Failed to get workspace diagnostics."),
+        TE.map((result) => {
+          const out: string[] = [];
+          let errors = 0;
+          let warnings = 0;
+          let filesWithIssues = 0;
+
+          for (const item of result.items) {
+            const display = path.isAbsolute(item.file) ? path.relative(cwd, item.file) : item.file;
+            if (item.status !== "success") {
+              out.push(`${display}: ${item.error || item.status}`);
+              continue;
+            }
+
+            const filtered = filterDiagnosticsBySeverity(item.diagnostics, command.severity);
+            if (filtered.length) {
+              filesWithIssues++;
+              out.push(`${display}:`);
+              for (const diagnostic of filtered) {
+                if (diagnostic.severity === 1) errors++;
+                else if (diagnostic.severity === 2) warnings++;
+                out.push(`  ${formatDiagnostic(diagnostic)}`);
+              }
+            }
+          }
+
+          const summary = `Analyzed ${result.items.length} file(s): ${errors} error(s), ${warnings} warning(s) in ${filesWithIssues} file(s)`;
+          const truncated = truncateHead(out, 500, 40 * 1024);
+          const diagnosticsText = truncated.truncated
+            ? `${truncated.content}\n\n[Truncated: ${truncated.outputLines} of ${truncated.totalLines} diagnostic lines. Use severity filter or fewer files to reduce output.]`
+            : (out.length ? out.join("\n") : "No diagnostics.");
+          return { content: [{ type: "text", text: `action: workspace-diagnostics\n${sevLine}${summary}\n\n${diagnosticsText}` }], details: result };
+        }),
+      );
+    case "signature":
+      return pipe(
+        runTask(() => abortable(manager.getSignatureHelpOption(command.file, command.line, command.column), signal), `Failed to get signature help for ${command.file}.`),
+        TE.map((result) => {
+          const signature = pipe(result, O.getOrElse<unknown>(() => null));
+          return { content: [{ type: "text", text: `action: signature\n${qLine}${posLine}${formatSignature(signature as any)}` }], details: signature };
+        }),
+      );
+    case "rename":
+      return pipe(
+        runTask(() => abortable(manager.renameOption(command.file, command.line, command.column, command.newName), signal), `Failed to rename symbol in ${command.file}.`),
+        TE.map((result) => pipe(
+          result,
+          O.match(
+            (): ToolResult => ({ content: [{ type: "text", text: `action: rename\n${qLine}${posLine}No rename available at this position.` }], details: null }),
+            (edit): ToolResult => {
+              const edits = formatWorkspaceEdit(edit, cwd);
+              return { content: [{ type: "text", text: `action: rename\n${qLine}${posLine}newName: ${command.newName}\n\n${edits}` }], details: edit };
+            },
+          ),
+        )),
+      );
+    case "codeAction":
+      return pipe(
+        runTask(() => abortable(manager.getCodeActions(command.file, command.line, command.column, command.endLine, command.endColumn), signal), `Failed to get code actions for ${command.file}.`),
+        TE.map((result) => {
+          const actions = formatCodeActions(result);
+          return { content: [{ type: "text", text: `action: codeAction\n${qLine}${posLine}${actions.length ? actions.join("\n") : "No code actions available."}` }], details: result };
+        }),
+      );
+  }
 }
 
 export default function (pi: ExtensionAPI) {
@@ -231,146 +331,40 @@ Actions: status, definition, references, hover, signature, rename (require file 
     parameters: LspParams,
 
     async execute(_toolCallId: string, params: LspParamsType, signalArg: unknown, onUpdateArg: unknown, ctxArg: unknown) {
-      const { signal, onUpdate, ctx } = normalizeExecuteArgs(onUpdateArg, ctxArg, signalArg);
-      if (signal?.aborted) return cancelledToolResult();
-      const manager = getOrCreateManager(ctx.cwd);
-      const { action, file, files, line, column, endLine, endColumn, query, newName, severity } = params as LspParamsType;
-      const sevFilter: SeverityFilter = severity || "all";
-      const needsFile = action !== "workspace-diagnostics" && action !== "status";
-      const needsPos = ["definition", "references", "hover", "signature", "rename", "codeAction"].includes(action);
-
-      try {
-        if (needsFile && !file) throw new Error(`Action "${action}" requires a file path.`);
-
-        let rLine = line, rCol = column, fromQuery = false;
-        if (needsPos && (rLine === undefined || rCol === undefined) && query && file) {
-          const resolved = await abortable(resolvePosition(manager, file, query), signal);
-          if (resolved) { rLine = resolved.line; rCol = resolved.column; fromQuery = true; }
-        }
-        if (needsPos && (rLine === undefined || rCol === undefined)) {
-          throw new Error(`Action "${action}" requires line/column or a query matching a symbol.`);
-        }
-
-        const qLine = query ? `query: ${query}\n` : "";
-        const sevLine = sevFilter !== "all" ? `severity: ${sevFilter}\n` : "";
-        const posLine = fromQuery && rLine && rCol ? `resolvedPosition: ${rLine}:${rCol}\n` : "";
-
-        switch (action) {
-          case "status": {
-            const support = inspectWorkspaceLsp(ctx.cwd);
-            if (!support.length) {
-              return {
-                content: [{
-                  type: "text",
-                  text: "action: status\nNo supported LSP workspace detected from the current cwd. If the project lives in a subdirectory, cd there first or use bash/read to inspect the repo layout.",
-                }],
-                details: { support: [] },
-              };
-            }
-
-            const lines = support.map((item) => {
-              const displayRoot = path.relative(ctx.cwd, item.root) || ".";
-              const availability = item.binaryAvailable ? `binary: ${item.binary}` : `binary missing: expected ${item.binary}`;
-              return `- ${item.language} (${item.serverId})\n  root: ${displayRoot}\n  ${availability}`;
+      const program = pipe(
+        TE.fromEither(normalizeExecuteArgsResult(onUpdateArg, ctxArg, signalArg)),
+        TE.chain((args) => {
+          if (args.signal?.aborted) {
+            return TE.left<ToolExecutionError, { args: typeof args; command: ExecutableLspCommand; manager: ReturnType<typeof getOrCreateManager> }>({
+              _tag: "CancelledError",
+              message: "Cancelled",
             });
+          }
 
-            return {
-              content: [{
-                type: "text",
-                text: `action: status\nDetected ${support.length} LSP workspace(s):\n${lines.join("\n")}`,
-              }],
-              details: { support },
-            };
-          }
-          case "definition": {
-            const results = await abortable(manager.getDefinition(file!, rLine!, rCol!), signal);
-            const locs = results.map(l => formatLocation(l, ctx?.cwd));
-            const payload = locs.length ? locs.join("\n") : fromQuery ? `${file}:${rLine}:${rCol}` : "No definitions found.";
-            return { content: [{ type: "text", text: `action: definition\n${qLine}${posLine}${payload}` }], details: results };
-          }
-          case "references": {
-            const results = await abortable(manager.getReferences(file!, rLine!, rCol!), signal);
-            const locs = results.map(l => formatLocation(l, ctx?.cwd));
-            return { content: [{ type: "text", text: `action: references\n${qLine}${posLine}${locs.length ? locs.join("\n") : "No references found."}` }], details: results };
-          }
-          case "hover": {
-            const result = await abortable(manager.getHover(file!, rLine!, rCol!), signal);
-            const payload = result ? formatHover(result.contents) || "No hover information." : "No hover information.";
-            return { content: [{ type: "text", text: `action: hover\n${qLine}${posLine}${payload}` }], details: result ?? null };
-          }
-          case "symbols":
-            {
-              const symbols = await abortable(manager.getDocumentSymbols(file!), signal);
-              const lines = collectSymbols(symbols, 0, [], query);
-              const truncated = truncateHead(lines, SYMBOLS_MAX_LINES, SYMBOLS_MAX_BYTES);
-              let payload: string;
-              if (truncated.truncated) {
-                payload = truncated.content;
-                payload += `\n\n[Truncated: ${truncated.outputLines} of ${truncated.totalLines} symbol lines shown. Use a narrower query to filter results.]`;
-              } else {
-                payload = lines.length ? lines.join("\n") : query ? `No symbols matching "${query}".` : "No symbols found.";
-              }
-              return { content: [{ type: "text", text: `action: symbols\n${qLine}${payload}` }], details: symbols };
-            }
-          case "diagnostics": {
-            const result = await abortable(manager.touchFileAndWait(file!, diagnosticsWaitMsForFile(file!)), signal);
-            const filtered = filterDiagnosticsBySeverity(result.diagnostics, sevFilter);
-            const payload = (result as any).unsupported
-              ? `Unsupported: ${(result as any).error || "No LSP for this file."}`
-              : !result.receivedResponse
-                ? "Timeout: LSP server did not respond. Try again."
-                : filtered.length ? filtered.map(formatDiagnostic).join("\n") : "No diagnostics.";
-            return { content: [{ type: "text", text: `action: diagnostics\n${sevLine}${payload}` }], details: { ...result, diagnostics: filtered } };
-          }
-          case "workspace-diagnostics": {
-            if (!files?.length) throw new Error('Action "workspace-diagnostics" requires a "files" array.');
-            const waitMs = Math.max(...files.map(diagnosticsWaitMsForFile));
-            const result = await abortable(manager.getDiagnosticsForFiles(files, waitMs), signal);
-            const out: string[] = [];
-            let errors = 0, warnings = 0, filesWithIssues = 0;
+          const manager = getOrCreateManager(args.ctx.cwd);
+          return pipe(
+            validateLspCommand(params as LspParamsType),
+            TE.fromEither,
+            TE.chain((command) => resolveValidatedCommand(command, {
+              resolvePosition: (file, query) => abortable(resolvePosition(manager, file, query), args.signal),
+            })),
+            TE.map((command) => ({ args, command, manager })),
+          );
+        }),
+        TE.chain(({ args, command, manager }) => executeValidatedCommand(command, {
+          cwd: args.ctx.cwd,
+          signal: args.signal,
+          manager,
+        })),
+      );
 
-            for (const item of result.items) {
-              const display = ctx?.cwd && path.isAbsolute(item.file) ? path.relative(ctx.cwd, item.file) : item.file;
-              if (item.status !== 'ok') { out.push(`${display}: ${item.error || item.status}`); continue; }
-              const filtered = filterDiagnosticsBySeverity(item.diagnostics, sevFilter);
-              if (filtered.length) {
-                filesWithIssues++;
-                out.push(`${display}:`);
-                for (const d of filtered) {
-                  if (d.severity === 1) errors++; else if (d.severity === 2) warnings++;
-                  out.push(`  ${formatDiagnostic(d)}`);
-                }
-              }
-            }
-
-            const summary = `Analyzed ${result.items.length} file(s): ${errors} error(s), ${warnings} warning(s) in ${filesWithIssues} file(s)`;
-            const truncated = truncateHead(out, 500, 40 * 1024);
-            const diagnosticsText = truncated.truncated
-              ? truncated.content + `\n\n[Truncated: ${truncated.outputLines} of ${truncated.totalLines} diagnostic lines. Use severity filter or fewer files to reduce output.]`
-              : (out.length ? out.join("\n") : "No diagnostics.");
-            return { content: [{ type: "text", text: `action: workspace-diagnostics\n${sevLine}${summary}\n\n${diagnosticsText}` }], details: result };
-          }
-          case "signature": {
-            const result = await abortable(manager.getSignatureHelp(file!, rLine!, rCol!), signal);
-            return { content: [{ type: "text", text: `action: signature\n${qLine}${posLine}${formatSignature(result)}` }], details: result ?? null };
-          }
-          case "rename": {
-            if (!newName) throw new Error('Action "rename" requires a "newName" parameter.');
-            const result = await abortable(manager.rename(file!, rLine!, rCol!, newName), signal);
-            if (!result) return { content: [{ type: "text", text: `action: rename\n${qLine}${posLine}No rename available at this position.` }], details: null };
-            const edits = formatWorkspaceEdit(result, ctx?.cwd);
-            return { content: [{ type: "text", text: `action: rename\n${qLine}${posLine}newName: ${newName}\n\n${edits}` }], details: result };
-          }
-          case "codeAction": {
-            const result = await abortable(manager.getCodeActions(file!, rLine!, rCol!, endLine, endColumn), signal);
-            const actions = formatCodeActions(result);
-            return { content: [{ type: "text", text: `action: codeAction\n${qLine}${posLine}${actions.length ? actions.join("\n") : "No code actions available."}` }], details: result };
-          }
-        }
-      } catch (e) {
-        if (signal?.aborted || isAbortedError(e)) return cancelledToolResult();
-        throw e;
+      const result = await program();
+      if (E.isLeft(result)) {
+        if (result.left._tag === "CancelledError") return cancelledToolResult();
+        throw new Error(formatToolExecutionError(result.left));
       }
+
+      return result.right;
     },
 
     renderCall(args: LspParamsType, theme: any) {
