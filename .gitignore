@@ -4,3 +4,4 @@ test-lsp.ts
 test.dart
 lib/
 *.log
+dist/
