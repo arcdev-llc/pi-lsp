@@ -24,7 +24,13 @@ function assertEqual<T>(actual: T, expected: T, message?: string) {
 // Or we can extract and test the logic directly
 // ============================================================================
 
-import { uriToPath, findSymbolPosition, formatDiagnostic, filterDiagnosticsBySeverity, collectSymbols } from "../lsp-core.js";
+import { mkdtemp, rm, writeFile } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
+import { isLeft, isRight } from "fp-ts/lib/Either.js";
+import { isNone, isSome } from "fp-ts/lib/Option.js";
+import { LSPManager, uriToPath, decodeFileUri, findSymbolPosition, findSymbolPositionOption, formatDiagnostic, filterDiagnosticsBySeverity, collectSymbols, toLegacyFileDiagnosticsResult, toLegacyTouchFileResult } from "../src/lsp-core.ts";
+import { formatToolExecutionError, isAbortedError, normalizeExecuteArgsResult, resolveValidatedCommand, toToolExecutionError, validateLspCommand } from "../src/lsp-tool-helpers.ts";
 
 // ============================================================================
 // uriToPath tests
@@ -48,6 +54,19 @@ test("uriToPath: passes through non-file URIs", () => {
 test("uriToPath: handles invalid URIs gracefully", () => {
   const result = uriToPath("not-a-valid-uri");
   assertEqual(result, "not-a-valid-uri");
+});
+
+test("decodeFileUri: returns Right for valid file URI", () => {
+  const result = decodeFileUri("file:///Users/test/file.ts");
+  if (!isRight(result)) throw new Error("Expected decodeFileUri to return Right");
+  assertEqual(result.right, "/Users/test/file.ts");
+});
+
+test("decodeFileUri: returns Left for invalid file URI", () => {
+  const result = decodeFileUri("file://%ZZ");
+  if (!isLeft(result)) throw new Error("Expected decodeFileUri to return Left");
+  assertEqual(result.left._tag, "UriToPathError");
+  assertEqual(result.left.uri, "file://%ZZ");
 });
 
 // ============================================================================
@@ -110,6 +129,255 @@ test("findSymbolPosition: case insensitive", () => {
   ];
   const pos = findSymbolPosition(symbols as any, "myfunction");
   assertEqual(pos, { line: 0, character: 0 });
+});
+
+test("findSymbolPositionOption: returns Some for exact match", () => {
+  const symbols = [
+    { name: "greet", range: { start: { line: 1, character: 2 }, end: { line: 1, character: 7 } }, selectionRange: { start: { line: 1, character: 2 }, end: { line: 1, character: 7 } }, kind: 12, children: [] },
+  ];
+  const pos = findSymbolPositionOption(symbols as any, "greet");
+  if (!isSome(pos)) throw new Error("Expected findSymbolPositionOption to return Some");
+  assertEqual(pos.value, { line: 1, character: 2 });
+});
+
+test("findSymbolPositionOption: returns None for blank query", () => {
+  const symbols = [
+    { name: "greet", range: { start: { line: 1, character: 2 }, end: { line: 1, character: 7 } }, selectionRange: { start: { line: 1, character: 2 }, end: { line: 1, character: 7 } }, kind: 12, children: [] },
+  ];
+  const pos = findSymbolPositionOption(symbols as any, "   ");
+  if (!isNone(pos)) throw new Error("Expected findSymbolPositionOption to return None");
+});
+
+// ============================================================================
+// normalizeExecuteArgsResult tests
+// ============================================================================
+
+test("normalizeExecuteArgsResult: supports runtime >= 0.51 argument order", () => {
+  const signal = new AbortController().signal;
+  const onUpdate = () => {};
+  const ctx = { cwd: "/tmp/project" };
+
+  const result = normalizeExecuteArgsResult(signal, onUpdate, ctx);
+  if (!isRight(result)) throw new Error("Expected normalizeExecuteArgsResult to return Right");
+  assertEqual(result.right.ctx, ctx);
+  assertEqual(result.right.signal, signal);
+  assertEqual(typeof result.right.onUpdate, "function");
+});
+
+test("normalizeExecuteArgsResult: supports runtime <= 0.50 argument order", () => {
+  const signal = new AbortController().signal;
+  const onUpdate = () => {};
+  const ctx = { cwd: "/tmp/project" };
+
+  const result = normalizeExecuteArgsResult(onUpdate, ctx, signal);
+  if (!isRight(result)) throw new Error("Expected normalizeExecuteArgsResult to return Right");
+  assertEqual(result.right.ctx, ctx);
+  assertEqual(result.right.signal, signal);
+  assertEqual(typeof result.right.onUpdate, "function");
+});
+
+test("normalizeExecuteArgsResult: returns Left for invalid execution context", () => {
+  const result = normalizeExecuteArgsResult(undefined, undefined, undefined);
+  if (!isLeft(result)) throw new Error("Expected normalizeExecuteArgsResult to return Left");
+  assertEqual(result.left._tag, "InvalidExecutionContextError");
+});
+
+// ============================================================================
+// validateLspCommand / resolveValidatedCommand tests
+// ============================================================================
+
+test("validateLspCommand: validates direct-position definition command", () => {
+  const result = validateLspCommand({ action: "definition", file: "src/lsp-tool.ts", line: 10, column: 4 });
+  if (!isRight(result)) throw new Error("Expected validateLspCommand to return Right");
+  assertEqual(result.right.action, "definition");
+  assertEqual(result.right.file, "src/lsp-tool.ts");
+  if (!("position" in result.right)) throw new Error("Expected position in validated command");
+  assertEqual(result.right.position._tag, "DirectPosition");
+});
+
+test("validateLspCommand: validates query-based definition command", () => {
+  const result = validateLspCommand({ action: "definition", file: "src/lsp-tool.ts", query: "execute" });
+  if (!isRight(result)) throw new Error("Expected validateLspCommand to return Right");
+  if (!("position" in result.right)) throw new Error("Expected position in validated command");
+  assertEqual(result.right.position._tag, "QueryPosition");
+  assertEqual(result.right.position.query, "execute");
+});
+
+test("validateLspCommand: returns Left when file is missing", () => {
+  const result = validateLspCommand({ action: "definition", line: 1, column: 1 } as any);
+  if (!isLeft(result)) throw new Error("Expected validateLspCommand to return Left");
+  assertEqual(result.left._tag, "ValidationError");
+  assertEqual(result.left.message, 'Action "definition" requires a file path.');
+});
+
+test("validateLspCommand: returns Left when rename newName is missing", () => {
+  const result = validateLspCommand({ action: "rename", file: "src/lsp-tool.ts", line: 1, column: 1 });
+  if (!isLeft(result)) throw new Error("Expected validateLspCommand to return Left");
+  assertEqual(result.left.message, 'Action "rename" requires a "newName" parameter.');
+});
+
+test("validateLspCommand: returns Left when workspace-diagnostics files are missing", () => {
+  const result = validateLspCommand({ action: "workspace-diagnostics" });
+  if (!isLeft(result)) throw new Error("Expected validateLspCommand to return Left");
+  assertEqual(result.left.message, 'Action "workspace-diagnostics" requires a "files" array.');
+});
+
+test("validateLspCommand: returns Left when position and query are missing", () => {
+  const result = validateLspCommand({ action: "hover", file: "src/lsp-tool.ts" });
+  if (!isLeft(result)) throw new Error("Expected validateLspCommand to return Left");
+  assertEqual(result.left.message, 'Action "hover" requires line/column or a query matching a symbol.');
+});
+
+test("resolveValidatedCommand: resolves query position into executable command", async () => {
+  const validated = validateLspCommand({ action: "definition", file: "src/lsp-tool.ts", query: "execute" });
+  if (!isRight(validated)) throw new Error("Expected validateLspCommand to return Right");
+
+  const result = await resolveValidatedCommand(validated.right, {
+    resolvePosition: async () => ({ line: 42, column: 7 }),
+  })();
+
+  if (!isRight(result)) throw new Error("Expected resolveValidatedCommand to return Right");
+  assertEqual(result.right.action, "definition");
+  if (!("fromQuery" in result.right)) throw new Error("Expected resolved position metadata");
+  assertEqual(result.right.fromQuery, true);
+  assertEqual(result.right.line, 42);
+  assertEqual(result.right.column, 7);
+});
+
+test("resolveValidatedCommand: returns Left when query cannot be resolved", async () => {
+  const validated = validateLspCommand({ action: "definition", file: "src/lsp-tool.ts", query: "missingSymbol" });
+  if (!isRight(validated)) throw new Error("Expected validateLspCommand to return Right");
+
+  const result = await resolveValidatedCommand(validated.right, {
+    resolvePosition: async () => null,
+  })();
+
+  if (!isLeft(result)) throw new Error("Expected resolveValidatedCommand to return Left");
+  assertEqual(result.left._tag, "PositionResolutionError");
+  assertEqual(result.left.message, 'Action "definition" requires line/column or a query matching a symbol.');
+});
+
+test("resolveValidatedCommand: returns CancelledError when resolution is aborted", async () => {
+  const validated = validateLspCommand({ action: "definition", file: "src/lsp-tool.ts", query: "missingSymbol" });
+  if (!isRight(validated)) throw new Error("Expected validateLspCommand to return Right");
+
+  const result = await resolveValidatedCommand(validated.right, {
+    resolvePosition: async () => {
+      throw new Error("aborted");
+    },
+  })();
+
+  if (!isLeft(result)) throw new Error("Expected resolveValidatedCommand to return Left");
+  assertEqual(result.left._tag, "CancelledError");
+  assertEqual(result.left.message, "Cancelled");
+});
+
+// ============================================================================
+// tool execution error tests
+// ============================================================================
+
+test("isAbortedError: detects aborted error", () => {
+  assertEqual(isAbortedError(new Error("aborted")), true);
+  assertEqual(isAbortedError(new Error("other")), false);
+});
+
+test("toToolExecutionError: maps aborted errors to CancelledError", () => {
+  const result = toToolExecutionError(new Error("aborted"), "should be ignored");
+  assertEqual(result._tag, "CancelledError");
+  assertEqual(result.message, "Cancelled");
+});
+
+test("formatToolExecutionError: returns error message", () => {
+  const result = formatToolExecutionError({ _tag: "ValidationError", message: "Bad input" });
+  assertEqual(result, "Bad input");
+});
+
+// ============================================================================
+// touchFile result adapter tests
+// ============================================================================
+
+test("toLegacyTouchFileResult: maps success result", () => {
+  const result = toLegacyTouchFileResult({ status: "success", diagnostics: [] });
+  assertEqual(result, { diagnostics: [], receivedResponse: true });
+});
+
+test("toLegacyTouchFileResult: maps unsupported result", () => {
+  const result = toLegacyTouchFileResult({ status: "unsupported", diagnostics: [], error: "No LSP" });
+  assertEqual(result, { diagnostics: [], receivedResponse: false, unsupported: true, error: "No LSP" });
+});
+
+test("toLegacyTouchFileResult: maps timeout result", () => {
+  const result = toLegacyTouchFileResult({ status: "timeout", diagnostics: [], error: "LSP did not respond" });
+  assertEqual(result, { diagnostics: [], receivedResponse: false, error: "LSP did not respond" });
+});
+
+test("toLegacyFileDiagnosticsResult: maps success and unsupported items", () => {
+  const result = toLegacyFileDiagnosticsResult({
+    items: [
+      { file: "a.ts", diagnostics: [], status: "success" },
+      { file: "b.ts", diagnostics: [], status: "unsupported", error: "No LSP" },
+    ],
+  });
+
+  assertEqual(result, {
+    items: [
+      { file: "a.ts", diagnostics: [], status: "ok" },
+      { file: "b.ts", diagnostics: [], status: "unsupported", error: "No LSP" },
+    ],
+  });
+});
+
+// ============================================================================
+// LSPManager unhappy-path boundary tests
+// ============================================================================
+
+test("LSPManager.touchFileAndWaitResult: missing file returns error status", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lsp-core-unit-"));
+  const manager = new LSPManager(dir);
+
+  try {
+    const result = await manager.touchFileAndWaitResult(join(dir, "missing.ts"), 100);
+    assertEqual(result.status, "error");
+    if (result.status !== "error") throw new Error("Expected error result");
+    assertEqual(result.error, "File not found");
+  } finally {
+    await manager.shutdown();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("LSPManager.touchFileAndWaitResult: unsupported file returns unsupported status", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lsp-core-unit-"));
+  const manager = new LSPManager(dir);
+
+  try {
+    const file = join(dir, "standalone.ts");
+    await writeFile(file, "const x = 1;\n");
+    const result = await manager.touchFileAndWaitResult(file, 100);
+    assertEqual(result.status, "unsupported");
+  } finally {
+    await manager.shutdown();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("LSPManager.getDiagnosticsForFilesResult: missing and unsupported files are typed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "lsp-core-unit-"));
+  const manager = new LSPManager(dir);
+
+  try {
+    const existing = join(dir, "standalone.ts");
+    const missing = join(dir, "missing.ts");
+    await writeFile(existing, "const x = 1;\n");
+
+    const result = await manager.getDiagnosticsForFilesResult([existing, missing], 100);
+    assertEqual(result.items.length, 2);
+    const statuses = result.items.map((item) => item.status).sort();
+    assertEqual(statuses, ["error", "unsupported"]);
+  } finally {
+    await manager.shutdown();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 // ============================================================================
